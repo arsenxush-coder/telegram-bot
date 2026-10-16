@@ -25,7 +25,7 @@ BOT_TOKEN = "8714625237:AAGOKvrckFK9cvHlAP0XF8rSfDA8xXDAEM4"  # <-- Вставь
 # Только эти люди могут пользоваться ботом.
 # Узнать ID: напишите боту @userinfobot
 ADMIN_IDS = [
-    121318132,   #<-- ВАШ Telegram ID (обязательно)
+    121318132,   # <-- ВАШ Telegram ID (обязательно)
     # 111111111, # помощник 1 — раскомментируйте и вставьте ID
     # 222222222, # помощник 2
 ]
@@ -694,13 +694,20 @@ async def workers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
 
+async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вход в диалог добавления работника (только через ConversationHandler)."""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "Имя нового работника:",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    )
+    return ADD_W_NAME
+
+
 async def workers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "w_add":
-        await query.message.reply_text("Имя нового работника:",
-                                       reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
-        return ADD_W_NAME
     if query.data == "w_edit":
         workers = await get_workers(active_only=False)
         buttons = [[InlineKeyboardButton(w["name"], callback_data=f"wedit_{w['id']}")] for w in workers]
@@ -1188,7 +1195,7 @@ def main():
     # Объект
     # Общий обработчик объектов (кроме создания и суммы — их ловят ConversationHandler)
     app.add_handler(CallbackQueryHandler(obj_callback, pattern="^obj_(info|close|close_yes|close_no)$"))
-    app.add_handler(CallbackQueryHandler(workers_callback, pattern="^w_(add|edit|delete)$"))
+    app.add_handler(CallbackQueryHandler(workers_callback, pattern="^w_(edit|delete)$"))
     app.add_handler(CallbackQueryHandler(worker_delete_confirm, pattern="^wdel_"))
 
     # Корректировка дней
@@ -1263,7 +1270,7 @@ def main():
 
     # Добавление работника
     conv_add_w = ConversationHandler(
-        entry_points=[CallbackQueryHandler(workers_callback, pattern="^w_add$")],
+        entry_points=[CallbackQueryHandler(start_add_worker, pattern="^w_add$")],
         states={
             ADD_W_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_name)],
             ADD_W_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_rate)],
