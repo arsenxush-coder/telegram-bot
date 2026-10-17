@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 # ================== БАЗА ДАННЫХ ==================
 async def init_db():
+    # создаём папку для базы (нужно для Volume /data)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS brigades (
@@ -443,24 +447,50 @@ async def obj_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
     name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Введите название объекта:")
+        return OBJ_NAME
     work_type = context.user_data.get("work_type", "profit")
     bid = get_user_brigade_id(update.effective_user.id, context)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE objects SET status = 'closed', closed_at = ? WHERE status = 'open' AND brigade_id = ?",
-            (datetime.now().isoformat(), bid)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE objects SET status = 'closed', closed_at = ? WHERE status = 'open' AND brigade_id = ?",
+                (datetime.now().isoformat(), bid)
+            )
+            cur = await db.execute(
+                "INSERT INTO objects (brigade_id, name, work_type, status) VALUES (?, ?, ?, 'open')",
+                (bid, name, work_type)
+            )
+            await db.commit()
+            new_id = cur.lastrowid
+    except Exception as e:
+        logger.exception("Ошибка создания объекта")
+        await update.message.reply_text(
+            f"❌ Ошибка сохранения объекта: {e}\n"
+            f"Путь БД: {DB_PATH}\nБригада: {bid}"
         )
-        await db.execute(
-            "INSERT INTO objects (brigade_id, name, work_type) VALUES (?, ?, ?)",
-            (bid, name, work_type)
-        )
-        await db.commit()
+        return ConversationHandler.END
+
+    # проверка, что объект реально в базе
+    obj = await get_active_object(bid)
     type_text = "за илтан" if work_type == "daily" else "с прибылью"
-    msg = f"✅ Объект «{name}» создан ({type_text})."
-    if work_type == "profit":
-        msg += "\nТеперь укажите сумму объекта через «🏗️ Объект»."
+    bname = await get_brigade_name(bid)
+    if obj and obj.get("name") == name:
+        msg = (
+            f"✅ Объект «{name}» создан ({type_text})\n"
+            f"Бригада: {bname}\n"
+            f"ID: {obj['id']}"
+        )
+        if work_type == "profit":
+            msg += "\n\nТеперь: 🏗️ Объект → Указать сумму"
+    else:
+        msg = (
+            f"⚠ Объект записан (id={new_id}), но не найден как активный.\n"
+            f"Бригада: {bid}, БД: {DB_PATH}\n"
+            f"Напишите /start и снова 🏗️ Объект"
+        )
     await update.message.reply_text(msg, reply_markup=main_keyboard(update.effective_user.id))
-    # не сбрасываем active_brigade_id
     keep = context.user_data.get("active_brigade_id")
     context.user_data.clear()
     if keep:
@@ -1417,7 +1447,11 @@ def main():
             OBJ_TYPE: [CallbackQueryHandler(choose_work_type, pattern="^type_")],
             OBJ_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, obj_name)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
+        fallbacks=[
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
     )
     app.add_handler(conv_obj)
 
