@@ -198,12 +198,20 @@ async def get_brigade_name(brigade_id: int) -> str:
             return row[0] if row else f"Бригада {brigade_id}"
 
 
-async def get_active_object(brigade_id: int) -> Optional[dict]:
+async def get_active_object(brigade_id: int = None) -> Optional[dict]:
+    """Активный объект: по бригаде, иначе любой открытый (чтобы не терялся)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        if brigade_id is not None:
+            async with db.execute(
+                "SELECT * FROM objects WHERE status = 'open' AND brigade_id = ? ORDER BY id DESC LIMIT 1",
+                (int(brigade_id),)
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    return dict(row)
         async with db.execute(
-            "SELECT * FROM objects WHERE status = 'open' AND brigade_id = ? ORDER BY id DESC LIMIT 1",
-            (brigade_id,)
+            "SELECT * FROM objects WHERE status = 'open' ORDER BY id DESC LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
