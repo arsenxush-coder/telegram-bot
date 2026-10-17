@@ -6,6 +6,7 @@ Telegram-бот для учёта рабочих дней бригады (сол
 
 import asyncio
 import logging
+import os
 from datetime import datetime, date
 from typing import Optional
 
@@ -34,7 +35,8 @@ USER_BRIGADE = {
     722258878: 2,    # Команда Дастана
 }
 
-DB_PATH = "brigade.db"
+# На Railway с Volume: переменная DB_PATH=/data/brigade.db
+DB_PATH = os.environ.get("DB_PATH", "brigade.db")
 DEFAULT_OT_RATE = 20000  # ₩ за 1 час сверхурочных
 HOURS_PER_DAY = 8
 
@@ -797,8 +799,15 @@ async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вход в диалог добавления работника (только через ConversationHandler)."""
     query = update.callback_query
     await query.answer()
+    # сохраняем бригаду, чистим временные поля прошлого диалога
+    keep = context.user_data.get("active_brigade_id")
+    for k in list(context.user_data.keys()):
+        if k != "active_brigade_id":
+            context.user_data.pop(k, None)
+    if keep:
+        context.user_data["active_brigade_id"] = keep
     await query.message.reply_text(
-        "Имя нового работника:",
+        "Имя нового работника:\n(или /start чтобы выйти)",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
     return ADD_W_NAME
@@ -888,11 +897,16 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except aiosqlite.IntegrityError:
             await update.message.reply_text("Такое имя уже есть.")
             return ConversationHandler.END
+    name = context.user_data.get("new_name", "")
+    rate = context.user_data.get("new_rate", 0)
     await update.message.reply_text(
-        f"✅ {context.user_data['new_name']} добавлен: {context.user_data['new_rate']:,} ₩ + {pct}%",
+        f"✅ {name} добавлен: {rate:,} ₩ + {pct}%",
         reply_markup=main_keyboard(update.effective_user.id)
     )
+    keep = context.user_data.get("active_brigade_id")
     context.user_data.clear()
+    if keep:
+        context.user_data["active_brigade_id"] = keep
     return ConversationHandler.END
 
 
@@ -1380,7 +1394,11 @@ def main():
             ADD_W_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_rate)],
             ADD_W_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_percent)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
+        fallbacks=[
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
     )
     app.add_handler(conv_add_w)
 
