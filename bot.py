@@ -715,7 +715,7 @@ async def advance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     workers = await get_workers(get_user_brigade_id(update.effective_user.id, context))
     buttons = [[InlineKeyboardButton(w["name"], callback_data=f"adv_{w['id']}")] for w in workers]
     buttons.append([InlineKeyboardButton("👥 Всем работникам", callback_data="adv_all")])
-    await update.message.reply_text("Кому выдать аванс? Можно выбрать одного или сразу всех.", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("Кому скорректировать аванс? Можно выбрать одного или сразу всех работников.", reply_markup=InlineKeyboardMarkup(buttons))
     return ADV_WORKER
 
 
@@ -733,7 +733,7 @@ async def advance_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with db.execute("SELECT name FROM workers WHERE id=?", (wid,)) as cur:
                 row = await cur.fetchone()
         context.user_data["worker_names"] = [row[0] if row else str(wid)]
-    await query.message.reply_text("Сумма аванса на каждого выбранного работника (только число):",
+    await query.message.reply_text("Введите сумму корректировки для каждого выбранного работника:\n➕ Например, 50000 — добавить аванс\n➖ Например, -20000 — уменьшить аванс или отметить возврат денег\nНоль вводить не нужно.",
                                    reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
     return ADV_AMOUNT
 
@@ -743,10 +743,10 @@ async def advance_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     try:
         amount = int(update.message.text.replace(" ", "").replace(",", ""))
-        if amount <= 0:
+        if amount == 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите положительное число.")
+        await update.message.reply_text("Введите ненулевую сумму: положительную для добавления или отрицательную для уменьшения аванса.")
         return ADV_AMOUNT
     context.user_data["amount"] = amount
     await update.message.reply_text(
@@ -773,7 +773,9 @@ async def advance_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         await db.commit()
     names = ", ".join(context.user_data.get("worker_names", [])) or "выбранным работникам"
-    await update.message.reply_text(f"✅ Аванс {context.user_data['amount']:,} ₩ каждому: {names}",
+    amount = context.user_data["amount"]
+    action = "Аванс добавлен" if amount > 0 else "Аванс уменьшен / возврат учтён"
+    await update.message.reply_text(f"✅ {action}: {amount:+,} ₩ на каждого. Работники: {names}",
                                     reply_markup=main_keyboard(update.effective_user.id))
     context.user_data.clear()
     return ConversationHandler.END
@@ -1485,8 +1487,10 @@ async def generate_report(object_id: int, brigade_id: int) -> str:
                 lines.append(f"  Зарплата: {wage:,} ₩")
             if share:
                 lines.append(f"  Доля прибыли ({w['percent']}%): {share:,} ₩")
-            if adv:
+            if adv > 0:
                 lines.append(f"  Авансы: −{adv:,} ₩")
+            elif adv < 0:
+                lines.append(f"  Возврат аванса: +{abs(adv):,} ₩")
             lines.append(f"  <b>К выплате: {to_pay:,} ₩</b>")
             lines.append("")
 
