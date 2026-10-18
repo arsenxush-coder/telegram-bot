@@ -24,9 +24,9 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 # Секреты задаются в переменных окружения Railway, не храните токен в GitHub.
-BOT_TOKEN = os.environ.get("8714625237:AAGOKvrckFK9cvHlAP0XF8rSfDA8xXDAEM4", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# Telegram ID главного администратора через Railway Variables: SUPER_ADMIN_IDS="123456789"
+# Telegram ID главного администратора через Railway Variables: SUPER_ADMIN_IDS="121318132"
 def _parse_ids(value: str) -> list[int]:
     result = []
     for item in value.split(","):
@@ -38,7 +38,7 @@ def _parse_ids(value: str) -> list[int]:
                 print(f"Предупреждение: некорректный Telegram ID пропущен: {item!r}")
     return result
 
-SUPER_ADMIN_IDS = _parse_ids(os.environ.get("121318132", ""))
+SUPER_ADMIN_IDS = _parse_ids(os.environ.get("SUPER_ADMIN_IDS", ""))
 
 # Кто к какой бригаде привязан (полный доступ только к своей)
 # brigade_id: 1 = Основная, 2 = Команда Дастана
