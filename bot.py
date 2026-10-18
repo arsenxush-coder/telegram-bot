@@ -714,16 +714,26 @@ async def advance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["object_id"] = obj["id"]
     workers = await get_workers(get_user_brigade_id(update.effective_user.id, context))
     buttons = [[InlineKeyboardButton(w["name"], callback_data=f"adv_{w['id']}")] for w in workers]
-    await update.message.reply_text("Кому выдать аванс?", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons.append([InlineKeyboardButton("👥 Всем работникам", callback_data="adv_all")])
+    await update.message.reply_text("Кому выдать аванс? Можно выбрать одного или сразу всех.", reply_markup=InlineKeyboardMarkup(buttons))
     return ADV_WORKER
 
 
 async def advance_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    wid = int(query.data.split("_")[1])
-    context.user_data["worker_id"] = wid
-    await query.message.reply_text("Сумма аванса (только число):",
+    target = query.data.split("_", 1)[1]
+    if target == "all":
+        context.user_data["worker_ids"] = [w["id"] for w in await get_workers(get_user_brigade_id(query.from_user.id, context))]
+        context.user_data["worker_names"] = [w["name"] for w in await get_workers(get_user_brigade_id(query.from_user.id, context))]
+    else:
+        wid = int(target)
+        context.user_data["worker_ids"] = [wid]
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT name FROM workers WHERE id=?", (wid,)) as cur:
+                row = await cur.fetchone()
+        context.user_data["worker_names"] = [row[0] if row else str(wid)]
+    await query.message.reply_text("Сумма аванса на каждого выбранного работника (только число):",
                                    reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
     return ADV_AMOUNT
 
@@ -754,14 +764,16 @@ async def advance_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     note = "" if update.message.text.strip() in ("Нет", "-", "нет") else update.message.text.strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO advances (object_id, worker_id, amount, note) VALUES (?, ?, ?, ?)",
-            (context.user_data["object_id"], context.user_data["worker_id"], context.user_data["amount"], note)
-        )
+        worker_ids = context.user_data.get("worker_ids", [context.user_data.get("worker_id")])
+        for wid in worker_ids:
+            if wid is not None:
+                await db.execute(
+                    "INSERT INTO advances (object_id, worker_id, amount, note) VALUES (?, ?, ?, ?)",
+                    (context.user_data["object_id"], wid, context.user_data["amount"], note)
+                )
         await db.commit()
-        async with db.execute("SELECT name FROM workers WHERE id = ?", (context.user_data["worker_id"],)) as cur:
-            name = (await cur.fetchone())[0]
-    await update.message.reply_text(f"✅ Аванс {context.user_data['amount']:,} ₩ выдан: {name}",
+    names = ", ".join(context.user_data.get("worker_names", [])) or "выбранным работникам"
+    await update.message.reply_text(f"✅ Аванс {context.user_data['amount']:,} ₩ каждому: {names}",
                                     reply_markup=main_keyboard(update.effective_user.id))
     context.user_data.clear()
     return ConversationHandler.END
@@ -879,7 +891,8 @@ async def workers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         brigade_id = get_user_brigade_id(update.effective_user.id, context)
         workers = await get_workers(brigade_id, active_only=False)
         buttons = [[InlineKeyboardButton(w["name"], callback_data=f"wedit_{w['id']}")] for w in workers]
-        await query.message.reply_text("Кого изменить?", reply_markup=InlineKeyboardMarkup(buttons))
+        buttons.append([InlineKeyboardButton("👥 Изменить всем работникам", callback_data="wedit_all")])
+        await query.message.reply_text("Выберите работника или измените ставку и процент сразу всем:", reply_markup=InlineKeyboardMarkup(buttons))
         return
     if query.data == "w_delete":
         workers = await get_workers(get_user_brigade_id(update.effective_user.id, context), active_only=True)
@@ -988,27 +1001,32 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def worker_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    try:
-        wid = int(query.data.split("_", 1)[1])
-    except (ValueError, IndexError):
-        await query.message.reply_text("Не удалось определить работника.")
-        return ConversationHandler.END
-
+    target = query.data.split("_", 1)[1]
     brigade_id = get_user_brigade_id(query.from_user.id, context)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT name, daily_rate, percent FROM workers WHERE id = ? AND brigade_id = ?",
-            (wid, brigade_id)
-        ) as cur:
-            worker = await cur.fetchone()
-    if not worker:
-        await query.message.reply_text("Работник не найден в текущей бригаде.")
-        return ConversationHandler.END
-
-    context.user_data["edit_worker_id"] = wid
+    if target == "all":
+        context.user_data["edit_all_workers"] = True
+        worker_label = "Все активные работники бригады"
+        current_label = "Для всех будет установлено одинаковое значение."
+    else:
+        try:
+            wid = int(target)
+        except (ValueError, IndexError):
+            await query.message.reply_text("Не удалось определить работника.")
+            return ConversationHandler.END
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT name, daily_rate, percent FROM workers WHERE id = ? AND brigade_id = ?",
+                (wid, brigade_id)
+            ) as cur:
+                worker = await cur.fetchone()
+        if not worker:
+            await query.message.reply_text("Работник не найден в текущей бригаде.")
+            return ConversationHandler.END
+        context.user_data["edit_worker_id"] = wid
+        worker_label = worker[0]
+        current_label = f"Текущая ставка: {worker[1]:,} ₩/день\nТекущий процент: {worker[2]}%"
     await query.message.reply_text(
-        f"Работник: {worker[0]}\nТекущая ставка: {worker[1]:,} ₩/день\n"
-        f"Текущий процент: {worker[2]}%\n\n"
+        f"Работник: {worker_label}\n{current_label}\n\n"
         "Введите новую дневную ставку и процент через пробел.\n"
         "Например: 170000 20\n"
         "Если процент не нужен, укажите 0.",
@@ -1038,18 +1056,25 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wid = context.user_data.get("edit_worker_id")
     brigade_id = get_user_brigade_id(update.effective_user.id, context)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE workers SET daily_rate = ?, percent = ? WHERE id = ? AND brigade_id = ?",
-            (rate, percent, wid, brigade_id)
-        )
+        if context.user_data.get("edit_all_workers"):
+            cur = await db.execute(
+                "UPDATE workers SET daily_rate = ?, percent = ? WHERE brigade_id = ? AND is_active = 1",
+                (rate, percent, brigade_id)
+            )
+        else:
+            cur = await db.execute(
+                "UPDATE workers SET daily_rate = ?, percent = ? WHERE id = ? AND brigade_id = ?",
+                (rate, percent, wid, brigade_id)
+            )
         await db.commit()
         if cur.rowcount == 0:
-            await update.message.reply_text("Не удалось изменить: работник не найден в текущей бригаде.")
+            await update.message.reply_text("Не удалось изменить: работники не найдены в текущей бригаде.")
             context.user_data.clear()
             return ConversationHandler.END
 
+    target_label = "у всех активных работников" if context.user_data.get("edit_all_workers") else "у работника"
     await update.message.reply_text(
-        f"✅ Ставка обновлена: {rate:,} ₩/день, доля прибыли: {percent:g}%",
+        f"✅ Ставка обновлена {target_label}: {rate:,} ₩/день, доля прибыли: {percent:g}%",
         reply_markup=main_keyboard(update.effective_user.id)
     )
     keep = context.user_data.get("active_brigade_id")
@@ -1060,44 +1085,100 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================== КОРРЕКТИРОВКА ДНЕЙ ==================
+async def corr_show_workers(message, context, user_id):
+    """Показывает мультивыбор работников для корректировки."""
+    workers = await get_workers(get_user_brigade_id(user_id, context))
+    selected = context.user_data.setdefault("corr_selected", set())
+    buttons, row = [], []
+    for w in workers:
+        mark = "✅ " if w["id"] in selected else ""
+        row.append(InlineKeyboardButton(f"{mark}{w['name']}", callback_data=f"corrw_{w['id']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("➡️ Продолжить", callback_data="corr_done")])
+    await message.reply_text(
+        "Выберите всех работников, которых нужно скорректировать. "
+        "Можно выбрать несколько, затем указать изменение для каждого.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
 async def corr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
     if not obj:
         await update.message.reply_text("Сначала создайте объект.")
         return ConversationHandler.END
     context.user_data["object_id"] = obj["id"]
-    workers = await get_workers(get_user_brigade_id(update.effective_user.id, context))
-    buttons = [[InlineKeyboardButton(w["name"], callback_data=f"corrw_{w['id']}")] for w in workers]
-    await update.message.reply_text(
-        "Кому скорректировать дни?\n(можно добавить или убавить, в т.ч. 0.5)",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    context.user_data["corr_selected"] = set()
+    await corr_show_workers(update.message, context, update.effective_user.id)
     return CORR_WORKER
 
 
 async def corr_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    wid = int(query.data.split("_")[1])
-    context.user_data["worker_id"] = wid
-    # Показать текущие дни
+    try:
+        wid = int(query.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Не удалось определить работника.", show_alert=True)
+        return CORR_WORKER
+    selected = context.user_data.setdefault("corr_selected", set())
+    if wid in selected:
+        selected.remove(wid)
+    else:
+        selected.add(wid)
+    workers = await get_workers(get_user_brigade_id(query.from_user.id, context))
+    buttons, row = [], []
+    for w in workers:
+        mark = "✅ " if w["id"] in selected else ""
+        row.append(InlineKeyboardButton(f"{mark}{w['name']}", callback_data=f"corrw_{w['id']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("➡️ Продолжить", callback_data="corr_done")])
+    await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+    return CORR_WORKER
+
+
+async def corr_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    selected = context.user_data.get("corr_selected", set())
+    if not selected:
+        await query.answer("Сначала выберите хотя бы одного работника.", show_alert=True)
+        return CORR_WORKER
+    workers = await get_workers(get_user_brigade_id(query.from_user.id, context))
+    context.user_data["corr_queue"] = [w for w in workers if w["id"] in selected]
+    context.user_data["corr_index"] = 0
+    await corr_prompt_current(query.message, context)
+    return CORR_DELTA
+
+
+async def corr_prompt_current(message, context):
+    queue = context.user_data.get("corr_queue", [])
+    idx = context.user_data.get("corr_index", 0)
+    worker = queue[idx]
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COALESCE(SUM(days),0) FROM work_logs WHERE object_id=? AND worker_id=?",
-            (context.user_data["object_id"], wid)
+            (context.user_data["object_id"], worker["id"])
         ) as cur:
             total = (await cur.fetchone())[0]
-        async with db.execute("SELECT name FROM workers WHERE id=?", (wid,)) as cur:
-            name = (await cur.fetchone())[0]
-    context.user_data["worker_name"] = name
-    await query.message.reply_text(
-        f"<b>{name}</b> — сейчас дней: <b>{total:g}</b>\n\n"
-        "Введите сколько добавить или убавить:\n"
-        "Примеры: <code>1</code>  <code>0.5</code>  <code>-1</code>  <code>-0.5</code>",
+    context.user_data["worker_id"] = worker["id"]
+    context.user_data["worker_name"] = worker["name"]
+    await message.reply_text(
+        f"<b>{worker['name']}</b> — сейчас дней: <b>{total:g}</b>\n"
+        f"Работник {idx + 1} из {len(queue)}.\n\n"
+        "Введите изменение дней: <code>1</code>, <code>0.5</code>, "
+        "<code>-1</code> или <code>-0.5</code>. Чтобы не менять, введите <code>0</code>.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
-    return CORR_DELTA
 
 
 async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1108,8 +1189,9 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not math.isfinite(delta):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите число, например 1 или -0.5")
+        await update.message.reply_text("Введите число, например 1, -0.5 или 0.")
         return CORR_DELTA
+
     object_id = context.user_data["object_id"]
     worker_id = context.user_data["worker_id"]
     name = context.user_data["worker_name"]
@@ -1121,16 +1203,12 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ) as cur:
             row = await cur.fetchone()
         if row:
-            new_days = (row[1] or 0) + delta
-            if new_days < 0:
-                new_days = 0
+            new_days = max(0, (row[1] or 0) + delta)
             await db.execute("UPDATE work_logs SET days=? WHERE id=?", (new_days, row[0]))
-        else:
-            # Создаём запись на сегодня с корректировкой
-            days_val = max(delta, 0)
+        elif delta > 0:
             await db.execute(
                 "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, ?, 0)",
-                (object_id, worker_id, today, days_val)
+                (object_id, worker_id, today, delta)
             )
         await db.commit()
         async with db.execute(
@@ -1138,14 +1216,20 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (object_id, worker_id)
         ) as cur:
             total = (await cur.fetchone())[0]
+
     sign = "+" if delta > 0 else ""
     await update.message.reply_text(
         f"✅ {name}: {sign}{delta:g} дн.\nТеперь всего дней: <b>{total:g}</b>",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(update.effective_user.id)
+        parse_mode="HTML"
     )
-    context.user_data.clear()
-    return ConversationHandler.END
+    context.user_data["corr_index"] += 1
+    if context.user_data["corr_index"] < len(context.user_data["corr_queue"]):
+        await corr_prompt_current(update.message, context)
+        return CORR_DELTA
+
+    context.user_data["corr_selected"] = set()
+    await corr_show_workers(update.message, context, update.effective_user.id)
+    return CORR_WORKER
 
 
 # ================== ПОСТУПЛЕНИЕ ОТ ЗАКАЗЧИКА ==================
@@ -1156,7 +1240,7 @@ async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data["object_id"] = obj["id"]
     await update.message.reply_text(
-        "Сумма поступления от заказчика (только число):",
+        "Сумма поступления/корректировки (например 50000 или -20000):",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
     return RCPT_AMOUNT
@@ -1167,10 +1251,10 @@ async def receipt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     try:
         amount = int(update.message.text.replace(" ", "").replace(",", ""))
-        if amount <= 0:
+        if amount == 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите положительное число.")
+        await update.message.reply_text("Введите целое число, отличное от нуля. Плюс добавляет поступление, минус уменьшает.")
         return RCPT_AMOUNT
     context.user_data["amount"] = amount
     await update.message.reply_text(
@@ -1202,7 +1286,7 @@ async def receipt_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_sum = (await cur.fetchone())[0] or 0
     left = total_sum - total_received
     await update.message.reply_text(
-        f"✅ Поступление {context.user_data['amount']:,} ₩ добавлено.\n\n"
+        f"✅ Корректировка поступления: {context.user_data['amount']:+,} ₩.\n\n"
         f"Всего получено: <b>{total_received:,} ₩</b>\n"
         f"Сумма объекта: {total_sum:,} ₩\n"
         f"Осталось получить: <b>{left:,} ₩</b>",
@@ -1222,8 +1306,9 @@ async def overtime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["object_id"] = obj["id"]
     workers = await get_workers(get_user_brigade_id(update.effective_user.id, context))
     buttons = [[InlineKeyboardButton(w["name"], callback_data=f"otw_{w['id']}")] for w in workers]
+    buttons.append([InlineKeyboardButton("👥 Всем работникам", callback_data="otw_all")])
     await update.message.reply_text(
-        "Кому добавить сверхурочные?\n(1 час = 20 000 ₩)",
+        "Кому добавить сверхурочные? Можно выбрать одного или сразу всех.\n(1 час = 20 000 ₩)",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
     return OT_WORKER
@@ -1232,10 +1317,20 @@ async def overtime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def overtime_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    wid = int(query.data.split("_")[1])
-    context.user_data["worker_id"] = wid
+    target = query.data.split("_", 1)[1]
+    if target == "all":
+        workers = await get_workers(get_user_brigade_id(query.from_user.id, context))
+        context.user_data["worker_ids"] = [w["id"] for w in workers]
+        context.user_data["worker_names"] = [w["name"] for w in workers]
+    else:
+        wid = int(target)
+        context.user_data["worker_ids"] = [wid]
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT name FROM workers WHERE id=?", (wid,)) as cur:
+                row = await cur.fetchone()
+        context.user_data["worker_names"] = [row[0] if row else str(wid)]
     await query.message.reply_text(
-        "Сколько часов добавить? (можно дробные, например 1.5):",
+        "Сколько часов добавить каждому выбранному работнику? (можно дробные, например 1.5):",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
     return OT_HOURS
@@ -1252,32 +1347,29 @@ async def overtime_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите положительное число.")
         return OT_HOURS
     object_id = context.user_data["object_id"]
-    worker_id = context.user_data["worker_id"]
-    # Добавляем к сегодняшней дате или к последней записи
+    worker_ids = context.user_data.get("worker_ids", [context.user_data.get("worker_id")])
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем есть ли запись на сегодня
-        async with db.execute(
-            "SELECT id, overtime_hours FROM work_logs WHERE object_id=? AND worker_id=? AND work_date=?",
-            (object_id, worker_id, today)
-        ) as cur:
-            row = await cur.fetchone()
-        if row:
-            new_ot = (row[1] or 0) + hours
-            await db.execute("UPDATE work_logs SET overtime_hours=? WHERE id=?", (new_ot, row[0]))
-        else:
-            # Создаём запись только со сверхурочными (days=0)
-            await db.execute(
-                "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, 0, ?)",
-                (object_id, worker_id, today, hours)
-            )
+        for worker_id in worker_ids:
+            if worker_id is None:
+                continue
+            async with db.execute(
+                "SELECT id, overtime_hours FROM work_logs WHERE object_id=? AND worker_id=? AND work_date=?",
+                (object_id, worker_id, today)
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                await db.execute("UPDATE work_logs SET overtime_hours=? WHERE id=?", ((row[1] or 0) + hours, row[0]))
+            else:
+                await db.execute(
+                    "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, 0, ?)",
+                    (object_id, worker_id, today, hours)
+                )
         await db.commit()
-        async with db.execute("SELECT name FROM workers WHERE id=?", (worker_id,)) as cur:
-            name = (await cur.fetchone())[0]
     ot_rate = int(float(await get_setting("ot_rate", str(DEFAULT_OT_RATE))))
     pay = int(hours * ot_rate)
     await update.message.reply_text(
-        f"✅ {name}: +{hours:g} ч сверхурочных (+{pay:,} ₩)",
+        f"✅ Каждому из выбранных работников ({', '.join(context.user_data.get('worker_names', []))}): +{hours:g} ч сверхурочных (+{pay:,} ₩ на человека)",
         reply_markup=main_keyboard(update.effective_user.id)
     )
     context.user_data.clear()
@@ -1480,7 +1572,7 @@ def main():
     conv_corr = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✏️ Корректировка дней$"), corr_start)],
         states={
-            CORR_WORKER: [CallbackQueryHandler(corr_worker, pattern="^corrw_")],
+            CORR_WORKER: [CallbackQueryHandler(corr_worker, pattern="^corrw_"), CallbackQueryHandler(corr_done, pattern="^corr_done$")],
             CORR_DELTA: [MessageHandler(filters.TEXT & ~filters.COMMAND, corr_delta)],
         },
         fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
@@ -1502,7 +1594,7 @@ def main():
     conv_ot = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Сверхурочные$"), overtime_start)],
         states={
-            OT_WORKER: [CallbackQueryHandler(overtime_worker, pattern="^otw_")],
+            OT_WORKER: [CallbackQueryHandler(overtime_worker, pattern=r"^otw_(all|\d+)$")],
             OT_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, overtime_hours)],
         },
         fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
@@ -1524,7 +1616,7 @@ def main():
     conv_adv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Аванс работнику$"), advance_start)],
         states={
-            ADV_WORKER: [CallbackQueryHandler(advance_worker, pattern="^adv_")],
+            ADV_WORKER: [CallbackQueryHandler(advance_worker, pattern=r"^adv_(all|\d+)$")],
             ADV_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, advance_amount)],
             ADV_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, advance_note)],
         },
@@ -1564,7 +1656,7 @@ def main():
 
     # Изменение дневной ставки и процента работника
     conv_edit_w = ConversationHandler(
-        entry_points=[CallbackQueryHandler(worker_edit_start, pattern="^wedit_")],
+        entry_points=[CallbackQueryHandler(worker_edit_start, pattern=r"^wedit_(all|\d+)$")],
         states={
             EDIT_W_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, worker_edit_value)],
         },
