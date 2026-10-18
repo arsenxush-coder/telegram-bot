@@ -7,6 +7,8 @@ Telegram-бот для учёта рабочих дней бригады (сол
 import asyncio
 import logging
 import os
+import math
+from html import escape
 from datetime import datetime, date
 from typing import Optional
 
@@ -21,17 +23,27 @@ from telegram.ext import (
 )
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "8714625237:AAGOKvrckFK9cvHlAP0XF8rSfDA8xXDAEM4"  # <-- Вставьте токен сюда
+# Секреты задаются в переменных окружения Railway, не храните токен в GitHub.
+BOT_TOKEN = os.environ.get("8714625237:AAGOKvrckFK9cvHlAP0XF8rSfDA8xXDAEM4", "").strip()
 
-# Главный (вы) — видит все бригады и может переключаться
-SUPER_ADMIN_IDS = [
-    121318132,   # <-- ВАШ Telegram ID
-]
+# Telegram ID главного администратора через Railway Variables: SUPER_ADMIN_IDS="123456789"
+def _parse_ids(value: str) -> list[int]:
+    result = []
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            try:
+                result.append(int(item))
+            except ValueError:
+                print(f"Предупреждение: некорректный Telegram ID пропущен: {item!r}")
+    return result
+
+SUPER_ADMIN_IDS = _parse_ids(os.environ.get("121318132", ""))
 
 # Кто к какой бригаде привязан (полный доступ только к своей)
 # brigade_id: 1 = Основная, 2 = Команда Дастана
 USER_BRIGADE = {
-    # 111111111: 1,   # помощник основной бригады
+    # 121318132: 1,   # помощник основной бригады
     722258878: 2,    # Команда Дастана
 }
 
@@ -134,11 +146,15 @@ async def init_db():
             "ALTER TABLE workers ADD COLUMN brigade_id INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE objects ADD COLUMN brigade_id INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE objects ADD COLUMN work_type TEXT DEFAULT 'profit'",
+            "ALTER TABLE workers ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE work_logs ADD COLUMN overtime_hours REAL NOT NULL DEFAULT 0",
         ]:
             try:
                 await db.execute(col_sql)
-            except Exception:
-                pass
+            except aiosqlite.OperationalError as exc:
+                # При повторном запуске столбец уже существует; другие ошибки не скрываем.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
         # Работники основной бригады
         workers = [
@@ -199,19 +215,14 @@ async def get_brigade_name(brigade_id: int) -> str:
 
 
 async def get_active_object(brigade_id: int = None) -> Optional[dict]:
-    """Активный объект: по бригаде, иначе любой открытый (чтобы не терялся)."""
+    """Возвращает только открытый объект указанной бригады."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if brigade_id is not None:
-            async with db.execute(
-                "SELECT * FROM objects WHERE status = 'open' AND brigade_id = ? ORDER BY id DESC LIMIT 1",
-                (int(brigade_id),)
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    return dict(row)
+        if brigade_id is None:
+            return None
         async with db.execute(
-            "SELECT * FROM objects WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM objects WHERE status = 'open' AND brigade_id = ? ORDER BY id DESC LIMIT 1",
+            (int(brigade_id),)
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
@@ -319,11 +330,20 @@ async def switch_brigade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def switch_brigade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not is_super(query.from_user.id):
         await query.answer("Нет доступа", show_alert=True)
         return
-    bid = int(query.data.split("_")[1])
+    await query.answer()
+    try:
+        bid = int(query.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("Не удалось определить бригаду.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM brigades WHERE id = ?", (bid,)) as cur:
+            if not await cur.fetchone():
+                await query.message.reply_text("Такая бригада не найдена.")
+                return
     context.user_data["active_brigade_id"] = bid
     name = await get_brigade_name(bid)
     await query.message.reply_text(
@@ -403,7 +423,8 @@ async def obj_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not obj:
             await query.message.reply_text("Нет активного объекта.")
             return
-        report = await generate_report(obj["id"])
+        brigade_id = get_user_brigade_id(update.effective_user.id, context)
+        report = await generate_report(obj["id"], brigade_id)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE objects SET status = 'closed', closed_at = ? WHERE id = ?",
                              (datetime.now().isoformat(), obj["id"]))
@@ -855,7 +876,8 @@ async def workers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "w_edit":
-        workers = await get_workers(get_user_brigade_id(update.effective_user.id, context), active_only=False)
+        brigade_id = get_user_brigade_id(update.effective_user.id, context)
+        workers = await get_workers(brigade_id, active_only=False)
         buttons = [[InlineKeyboardButton(w["name"], callback_data=f"wedit_{w['id']}")] for w in workers]
         await query.message.reply_text("Кого изменить?", reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -902,16 +924,24 @@ async def worker_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 async def add_worker_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
-    context.user_data["new_name"] = update.message.text.strip()
-    await update.message.reply_text("Дневная ставка (число):")
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Имя не может быть пустым. Введите имя:")
+        return ADD_W_NAME
+    context.user_data["new_name"] = name
+    await update.message.reply_text("Дневная ставка (целое число в вонах, не меньше 0):")
     return ADD_W_RATE
 
 
 async def add_worker_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Отмена":
+        return await cancel(update, context)
     try:
         rate = int(update.message.text.replace(" ", "").replace(",", ""))
+        if rate < 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите число.")
+        await update.message.reply_text("Введите целое число 0 или больше.")
         return ADD_W_RATE
     context.user_data["new_rate"] = rate
     await update.message.reply_text("Процент от прибыли (0 если нет):")
@@ -919,10 +949,15 @@ async def add_worker_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Отмена":
+        return await cancel(update, context)
     try:
         pct = float(update.message.text.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Введите число.")
+        await update.message.reply_text("Введите число от 0 до 100.")
+        return ADD_W_PERCENT
+    if not 0 <= pct <= 100:
+        await update.message.reply_text("Процент должен быть от 0 до 100.")
         return ADD_W_PERCENT
     async with aiosqlite.connect(DB_PATH) as db:
         try:
@@ -939,6 +974,82 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
     rate = context.user_data.get("new_rate", 0)
     await update.message.reply_text(
         f"✅ {name} добавлен: {rate:,} ₩ + {pct}%",
+        reply_markup=main_keyboard(update.effective_user.id)
+    )
+    keep = context.user_data.get("active_brigade_id")
+    context.user_data.clear()
+    if keep:
+        context.user_data["active_brigade_id"] = keep
+    return ConversationHandler.END
+
+
+
+
+async def worker_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        wid = int(query.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("Не удалось определить работника.")
+        return ConversationHandler.END
+
+    brigade_id = get_user_brigade_id(query.from_user.id, context)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name, daily_rate, percent FROM workers WHERE id = ? AND brigade_id = ?",
+            (wid, brigade_id)
+        ) as cur:
+            worker = await cur.fetchone()
+    if not worker:
+        await query.message.reply_text("Работник не найден в текущей бригаде.")
+        return ConversationHandler.END
+
+    context.user_data["edit_worker_id"] = wid
+    await query.message.reply_text(
+        f"Работник: {worker[0]}\nТекущая ставка: {worker[1]:,} ₩/день\n"
+        f"Текущий процент: {worker[2]}%\n\n"
+        "Введите новую дневную ставку и процент через пробел.\n"
+        "Например: 170000 20\n"
+        "Если процент не нужен, укажите 0.",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    )
+    return EDIT_W_VALUE
+
+
+async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Отмена":
+        return await cancel(update, context)
+    parts = update.message.text.split()
+    if len(parts) != 2:
+        await update.message.reply_text("Введите два значения через пробел, например: 170000 20")
+        return EDIT_W_VALUE
+    try:
+        # Ставка целая; допускаем ввод 170,000 или 170000.
+        rate_text = parts[0].replace(",", "")
+        rate = int(rate_text)
+        percent = float(parts[1].replace(",", "."))
+        if rate < 0 or not 0 <= percent <= 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Ставка должна быть целым числом ≥ 0, процент — от 0 до 100.")
+        return EDIT_W_VALUE
+
+    wid = context.user_data.get("edit_worker_id")
+    brigade_id = get_user_brigade_id(update.effective_user.id, context)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE workers SET daily_rate = ?, percent = ? WHERE id = ? AND brigade_id = ?",
+            (rate, percent, wid, brigade_id)
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            await update.message.reply_text("Не удалось изменить: работник не найден в текущей бригаде.")
+            context.user_data.clear()
+            return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"✅ Ставка обновлена: {rate:,} ₩/день, доля прибыли: {percent:g}%",
         reply_markup=main_keyboard(update.effective_user.id)
     )
     keep = context.user_data.get("active_brigade_id")
@@ -994,6 +1105,8 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     try:
         delta = float(update.message.text.replace(",", "."))
+        if not math.isfinite(delta):
+            raise ValueError
     except ValueError:
         await update.message.reply_text("Введите число, например 1 или -0.5")
         return CORR_DELTA
@@ -1133,7 +1246,7 @@ async def overtime_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     try:
         hours = float(update.message.text.replace(",", "."))
-        if hours <= 0:
+        if not math.isfinite(hours) or hours <= 0:
             raise ValueError
     except ValueError:
         await update.message.reply_text("Введите положительное число.")
@@ -1177,16 +1290,17 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not obj:
         await update.message.reply_text("Нет активного объекта.")
         return
-    report = await generate_report(obj["id"])
+    brigade_id = get_user_brigade_id(update.effective_user.id, context)
+    report = await generate_report(obj["id"], brigade_id)
     await update.message.reply_text(report, parse_mode="HTML")
 
 
-async def generate_report(object_id: int) -> str:
+async def generate_report(object_id: int, brigade_id: int) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM objects WHERE id = ?", (object_id,)) as cur:
             obj = dict(await cur.fetchone())
-        workers = await get_workers(get_user_brigade_id(update.effective_user.id, context), active_only=False)
+        workers = await get_workers(brigade_id, active_only=False)
         worker_map = {w["id"]: w for w in workers}
 
         async with db.execute(
@@ -1238,7 +1352,7 @@ async def generate_report(object_id: int) -> str:
 
         type_label = "📅 Работа за илтан" if is_daily else "💰 С прибылью"
         lines = [
-            f"<b>📋 ОТЧЁТ: {obj['name']}</b>",
+            f"<b>📋 ОТЧЁТ: {escape(str(obj['name']))}</b>",
             f"Тип: {type_label}",
             f"Статус: {obj['status']}",
             "",
@@ -1273,7 +1387,7 @@ async def generate_report(object_id: int) -> str:
                 continue
             grand_total += max(to_pay, 0)
             days, ot = days_info.get(wid, (0, 0))
-            lines.append(f"<b>{w['name']}</b>")
+            lines.append(f"<b>{escape(str(w['name']))}</b>")
             if days:
                 lines.append(f"  Дней: {days:g}" + (f" + {ot:g} ч сверхурочно" if ot else ""))
                 lines.append(f"  Зарплата: {wage:,} ₩")
@@ -1333,6 +1447,14 @@ async def post_init(app: Application):
 
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Не задан BOT_TOKEN. Добавьте токен бота в Railway → Variables → BOT_TOKEN."
+        )
+    if not SUPER_ADMIN_IDS:
+        raise RuntimeError(
+            "Не задан SUPER_ADMIN_IDS. Добавьте свой Telegram ID в Railway → Variables → SUPER_ADMIN_IDS."
+        )
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Защита: только люди из ADMIN_IDS
@@ -1439,6 +1561,20 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv_add_w)
+
+    # Изменение дневной ставки и процента работника
+    conv_edit_w = ConversationHandler(
+        entry_points=[CallbackQueryHandler(worker_edit_start, pattern="^wedit_")],
+        states={
+            EDIT_W_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, worker_edit_value)],
+        },
+        fallbacks=[
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_w)
 
     # Настройки
     conv_set = ConversationHandler(
