@@ -40,7 +40,7 @@ def _parse_ids(value: str) -> list[int]:
     return result
 
 
-SUPER_ADMIN_IDS = _parse_ids(os.environ.get("SUPER_ADMIN_IDS", ""))
+SUPER_ADMIN_IDS = _parse_ids(os.environ.get("121318132", ""))
 
 # brigade_id: 1 = Основная, 2 = Команда Дастана
 USER_BRIGADE = {
