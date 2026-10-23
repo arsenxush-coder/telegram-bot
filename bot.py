@@ -2,6 +2,8 @@
 """
 Telegram-бот для учёта рабочих дней бригады (солнечные панели)
 Библиотека: python-telegram-bot + aiosqlite
+
+Версия 2: исправлены баги, добавлено редактирование записей и просмотр по дням.
 """
 
 import asyncio
@@ -9,7 +11,7 @@ import logging
 import os
 import math
 from html import escape
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import aiosqlite
@@ -23,10 +25,9 @@ from telegram.ext import (
 )
 
 # ================== НАСТРОЙКИ ==================
-# Секреты задаются в переменных окружения Railway, не храните токен в GitHub.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# Telegram ID главного администратора через Railway Variables: SUPER_ADMIN_IDS="121318132"
+
 def _parse_ids(value: str) -> list[int]:
     result = []
     for item in value.split(","):
@@ -38,32 +39,32 @@ def _parse_ids(value: str) -> list[int]:
                 print(f"Предупреждение: некорректный Telegram ID пропущен: {item!r}")
     return result
 
-SUPER_ADMIN_IDS = _parse_ids(os.environ.get("121318132", ""))
 
-# Кто к какой бригаде привязан (полный доступ только к своей)
+SUPER_ADMIN_IDS = _parse_ids(os.environ.get("SUPER_ADMIN_IDS", ""))
+
 # brigade_id: 1 = Основная, 2 = Команда Дастана
 USER_BRIGADE = {
-    # 121318132: 1,   # помощник основной бригады
     722258878: 2,    # Команда Дастана
 }
 
-# На Railway с Volume: переменная DB_PATH=/data/brigade.db
 DB_PATH = os.environ.get("DB_PATH", "brigade.db")
-DEFAULT_OT_RATE = 20000  # ₩ за 1 час сверхурочных
+DEFAULT_OT_RATE = 20000
 HOURS_PER_DAY = 8
 
 # Состояния ConversationHandler
 (
     MARK_DATE, MARK_WORKERS, MARK_OVERTIME,
     ADV_WORKER, ADV_AMOUNT, ADV_NOTE,
-    EXP_AMOUNT, EXP_DESC,
+    EXP_CATEGORY, EXP_AMOUNT, EXP_DESC,
     OBJ_TYPE, OBJ_NAME, OBJ_SUM,
     ADD_W_NAME, ADD_W_RATE, ADD_W_PERCENT,
     EDIT_W_VALUE, OT_COEFF,
     OT_WORKER, OT_HOURS,
     RCPT_AMOUNT, RCPT_NOTE,
-    CORR_WORKER, CORR_DELTA
-) = range(22)
+    CORR_WORKER, CORR_DELTA,
+    EDIT_MENU, EDIT_PICK_RECORD, EDIT_NEW_VALUE,
+    DAILY_PICK_DATE,
+) = range(27)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +72,6 @@ logger = logging.getLogger(__name__)
 
 # ================== БАЗА ДАННЫХ ==================
 async def init_db():
-    # создаём папку для базы (нужно для Volume /data)
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -147,12 +147,23 @@ async def init_db():
                 details TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS edit_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brigade_id INTEGER NOT NULL,
+                object_id INTEGER,
+                table_name TEXT NOT NULL,
+                row_id INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                user_id INTEGER NOT NULL,
+                user_name TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
-        # Бригады
         await db.execute("INSERT OR IGNORE INTO brigades (id, name) VALUES (1, 'Основная')")
         await db.execute("INSERT OR IGNORE INTO brigades (id, name) VALUES (2, 'Команда Дастана')")
 
-        # Миграции старых баз
         for col_sql in [
             "ALTER TABLE workers ADD COLUMN brigade_id INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE objects ADD COLUMN brigade_id INTEGER NOT NULL DEFAULT 1",
@@ -161,15 +172,21 @@ async def init_db():
             "ALTER TABLE work_logs ADD COLUMN overtime_hours REAL NOT NULL DEFAULT 0",
             "ALTER TABLE expenses ADD COLUMN user_id INTEGER",
             "ALTER TABLE expenses ADD COLUMN user_name TEXT",
+            "ALTER TABLE work_logs ADD COLUMN updated_at TEXT",
+            "ALTER TABLE work_logs ADD COLUMN updated_by INTEGER",
+            "ALTER TABLE advances ADD COLUMN updated_at TEXT",
+            "ALTER TABLE advances ADD COLUMN updated_by INTEGER",
+            "ALTER TABLE expenses ADD COLUMN updated_at TEXT",
+            "ALTER TABLE expenses ADD COLUMN updated_by INTEGER",
+            "ALTER TABLE receipts ADD COLUMN updated_at TEXT",
+            "ALTER TABLE receipts ADD COLUMN updated_by INTEGER",
         ]:
             try:
                 await db.execute(col_sql)
             except aiosqlite.OperationalError as exc:
-                # При повторном запуске столбец уже существует; другие ошибки не скрываем.
                 if "duplicate column name" not in str(exc).lower():
                     raise
 
-        # Работники основной бригады
         workers = [
             ("Хушнуд", 220000, 40),
             ("Бато", 170000, 20),
@@ -221,23 +238,40 @@ def get_user_brigade_id(user_id: int, context: ContextTypes.DEFAULT_TYPE = None)
 
 
 def clear_temp_data(context: ContextTypes.DEFAULT_TYPE):
-    """Очищает временные данные диалога, сохраняя выбранную главным бригаду."""
     active_brigade = context.user_data.get("active_brigade_id")
     context.user_data.clear()
     if active_brigade is not None:
         context.user_data["active_brigade_id"] = active_brigade
 
 
+def _user_display_name(user) -> str:
+    parts = [user.first_name, user.last_name]
+    full = " ".join(p for p in parts if p)
+    return full or user.username or str(user.id)
+
+
 async def audit_log(db, update: Update, context: ContextTypes.DEFAULT_TYPE,
                     object_id: int | None, action: str, details: str):
     user = update.effective_user
     brigade_id = get_user_brigade_id(user.id, context)
-    full_name = " ".join(part for part in [user.first_name, user.last_name] if part)
     await db.execute(
         """INSERT INTO audit_logs
            (brigade_id, object_id, user_id, username, user_name, action, details)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (brigade_id, object_id, user.id, user.username, full_name or str(user.id), action, details)
+        (brigade_id, object_id, user.id, user.username, _user_display_name(user), action, details)
+    )
+
+
+async def log_edit(db, brigade_id: int, object_id: int | None, table_name: str, row_id: int,
+                   field: str, old_value, new_value, user):
+    await db.execute(
+        """INSERT INTO edit_history
+           (brigade_id, object_id, table_name, row_id, field, old_value, new_value, user_id, user_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (brigade_id, object_id, table_name, row_id, field,
+         str(old_value) if old_value is not None else None,
+         str(new_value) if new_value is not None else None,
+         user.id, _user_display_name(user))
     )
 
 
@@ -249,7 +283,6 @@ async def get_brigade_name(brigade_id: int) -> str:
 
 
 async def get_active_object(brigade_id: int = None) -> Optional[dict]:
-    """Возвращает только открытый объект указанной бригады."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if brigade_id is None:
@@ -295,7 +328,8 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("✏️ Корректировка дней"), KeyboardButton("➕ Сверхурочные")],
         [KeyboardButton("💰 Аванс работнику"), KeyboardButton("💵 Поступление")],
         [KeyboardButton("🧾 Расход"), KeyboardButton("📊 Отчёт")],
-        [KeyboardButton("📅 Расходы по дням")],
+        [KeyboardButton("📅 Расходы по дням"), KeyboardButton("📆 Всё по дням")],
+        [KeyboardButton("✏️ Редактировать запись")],
         [KeyboardButton("🕘 История операций")],
         [KeyboardButton("👷 Работники")],
         [KeyboardButton("🏗️ Объект"), KeyboardButton("⚙️ Настройки")],
@@ -315,7 +349,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Бот учёта бригады</b>\n\n"
         f"Бригада: <b>{bname}</b>\n\n"
         "Отмечайте рабочие дни, авансы и расходы.\n"
-        "В конце объекта нажмите «Закрыть объект»."
+        "В конце объекта нажмите «Закрыть объект».\n\n"
+        "<b>Новое:</b>\n"
+        "• ✏️ Редактировать запись — исправить любую запись\n"
+        "• 📆 Всё по дням — детальный просмотр по датам"
     )
     if is_super(user_id):
         text += "\n\nВы главный — можете переключать бригады («🔄 Сменить бригаду»)."
@@ -330,9 +367,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Каждый день: 📅 Отметить день\n"
         "4. Добавляйте авансы и расходы\n"
         "5. Когда закончили — Закрыть объект\n\n"
+        "<b>Исправление ошибок:</b>\n"
+        "✏️ Редактировать запись — выбрать тип, найти запись и ввести новое значение.\n\n"
+        "<b>Просмотр по датам:</b>\n"
+        "📆 Всё по дням — дни, расходы, авансы, поступления за день/неделю.\n\n"
         "<b>Формула:</b>\n"
         "Прибыль = Сумма объекта − Зарплаты − Расходы\n"
-        "Прибыль делится: Хушнуд 40%, Бато/Мумин/Дастан по 20%"
+        "Прибыль делится между <b>активными</b> работниками по проценту."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -403,7 +444,7 @@ async def object_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb_buttons.append([InlineKeyboardButton("📋 Инфо об объекте", callback_data="obj_info")])
         kb = InlineKeyboardMarkup(kb_buttons)
         type_label = "илтан" if (obj.get("work_type") or "profit") == "daily" else "с прибылью"
-        text = f"<b>Текущий объект:</b> {obj['name']}\nТип: {type_label}\nСумма: {obj['total_sum']:,} ₩\nСтатус: открыт"
+        text = f"<b>Текущий объект:</b> {escape(obj['name'])}\nТип: {type_label}\nСумма: {obj['total_sum']:,} ₩\nСтатус: открыт"
     else:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Новый объект", callback_data="obj_new")]])
         text = "Нет активного объекта. Создайте новый."
@@ -431,7 +472,7 @@ async def obj_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 received = (await cur.fetchone())[0]
         total = obj["total_sum"] or 0
         text = (
-            f"<b>Объект:</b> {obj['name']}\n"
+            f"<b>Объект:</b> {escape(obj['name'])}\n"
             f"Сумма: <b>{total:,} ₩</b>\n"
             f"Получено: <b>{received:,} ₩</b>\n"
             f"Осталось получить: <b>{total - received:,} ₩</b>\n"
@@ -465,7 +506,7 @@ async def obj_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.execute("UPDATE objects SET status = 'closed', closed_at = ? WHERE id = ?",
                              (datetime.now().isoformat(), obj["id"]))
             await db.commit()
-        await query.message.reply_text(f"🔒 Объект «{obj['name']}» закрыт.\n\n{report}", parse_mode="HTML",
+        await query.message.reply_text(f"🔒 Объект «{escape(obj['name'])}» закрыт.\n\n{report}", parse_mode="HTML",
                                        reply_markup=main_keyboard(update.effective_user.id))
         return
 
@@ -537,14 +578,13 @@ async def obj_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # проверка, что объект реально в базе
     obj = await get_active_object(bid)
     type_text = "за илтан" if work_type == "daily" else "с прибылью"
     bname = await get_brigade_name(bid)
     if obj and obj.get("name") == name:
         msg = (
-            f"✅ Объект «{name}» создан ({type_text})\n"
-            f"Бригада: {bname}\n"
+            f"✅ Объект «{escape(name)}» создан ({type_text})\n"
+            f"Бригада: {escape(bname)}\n"
             f"ID: {obj['id']}"
         )
         if work_type == "profit":
@@ -555,7 +595,7 @@ async def obj_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Бригада: {bid}, БД: {DB_PATH}\n"
             f"Напишите /start и снова 🏗️ Объект"
         )
-    await update.message.reply_text(msg, reply_markup=main_keyboard(update.effective_user.id))
+    await update.message.reply_text(msg, reply_markup=main_keyboard(update.effective_user.id), parse_mode="HTML")
     keep = context.user_data.get("active_brigade_id")
     clear_temp_data(context)
     if keep:
@@ -582,7 +622,6 @@ async def obj_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.commit()
     await update.message.reply_text(f"✅ Сумма объекта: {amount:,} ₩", reply_markup=main_keyboard(update.effective_user.id))
     return ConversationHandler.END
-
 
 # ================== ОТМЕТИТЬ ДЕНЬ ==================
 async def mark_day_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -662,6 +701,8 @@ async def mark_workers_callback(update: Update, context: ContextTypes.DEFAULT_TY
                        DO UPDATE SET days = excluded.days""",
                     (object_id, w["id"], work_date, days_val)
                 )
+            await audit_log(db, update, context, object_id, "Отметка дня",
+                            f"Дата {work_date}; {'полдня' if days_val == 0.5 else 'полный день'}; работники: {', '.join(w['name'] for w in selected_workers)}")
             await db.commit()
         names = ", ".join(w["name"] for w in selected_workers)
         day_text = "полный день" if days_val == 1 else "полдня"
@@ -697,50 +738,6 @@ async def mark_workers_callback(update: Update, context: ContextTypes.DEFAULT_TY
     return MARK_WORKERS
 
 
-async def mark_overtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "❌ Отмена":
-        return await cancel(update, context)
-    try:
-        hours = float(update.message.text.replace(",", "."))
-        if hours < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число ≥ 0")
-        return MARK_OVERTIME
-
-    selected_workers = context.user_data["selected_workers"]
-    ot_index = context.user_data["ot_index"]
-    overtime = context.user_data.get("overtime", {})
-    worker = selected_workers[ot_index]
-    overtime[worker["id"]] = hours
-    ot_index += 1
-
-    if ot_index >= len(selected_workers):
-        object_id = context.user_data["object_id"]
-        work_date = context.user_data["work_date"]
-        async with aiosqlite.connect(DB_PATH) as db:
-            for w in selected_workers:
-                await db.execute(
-                    """INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours)
-                       VALUES (?, ?, ?, 1, ?)
-                       ON CONFLICT(object_id, worker_id, work_date)
-                       DO UPDATE SET days=1, overtime_hours=excluded.overtime_hours""",
-                    (object_id, w["id"], work_date, overtime.get(w["id"], 0))
-                )
-            await db.commit()
-        names = ", ".join(w["name"] for w in selected_workers)
-        await update.message.reply_text(f"✅ Отмечено за {work_date}:\n{names}",
-                                        reply_markup=main_keyboard(update.effective_user.id))
-        clear_temp_data(context)
-        return ConversationHandler.END
-    else:
-        context.user_data["ot_index"] = ot_index
-        context.user_data["overtime"] = overtime
-        next_w = selected_workers[ot_index]
-        await update.message.reply_text(f"Сверхурочные часы для <b>{next_w['name']}</b> (0 если нет):", parse_mode="HTML")
-        return MARK_OVERTIME
-
-
 # ================== АВАНС ==================
 async def advance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
@@ -760,8 +757,9 @@ async def advance_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     target = query.data.split("_", 1)[1]
     if target == "all":
-        context.user_data["worker_ids"] = [w["id"] for w in await get_workers(get_user_brigade_id(query.from_user.id, context))]
-        context.user_data["worker_names"] = [w["name"] for w in await get_workers(get_user_brigade_id(query.from_user.id, context))]
+        workers = await get_workers(get_user_brigade_id(query.from_user.id, context))
+        context.user_data["worker_ids"] = [w["id"] for w in workers]
+        context.user_data["worker_names"] = [w["name"] for w in workers]
     else:
         wid = int(target)
         context.user_data["worker_ids"] = [wid]
@@ -769,8 +767,13 @@ async def advance_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with db.execute("SELECT name FROM workers WHERE id=?", (wid,)) as cur:
                 row = await cur.fetchone()
         context.user_data["worker_names"] = [row[0] if row else str(wid)]
-    await query.message.reply_text("Введите сумму корректировки для каждого выбранного работника:\n➕ Например, 50000 — добавить аванс\n➖ Например, -20000 — уменьшить аванс или отметить возврат денег\nНоль вводить не нужно.",
-                                   reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
+    await query.message.reply_text(
+        "Введите сумму корректировки для каждого выбранного работника:\n"
+        "➕ Например, 50000 — добавить аванс\n"
+        "➖ Например, -20000 — уменьшить аванс или отметить возврат денег\n"
+        "Ноль вводить не нужно.",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    )
     return ADV_AMOUNT
 
 
@@ -799,16 +802,21 @@ async def advance_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
     note = "" if update.message.text.strip() in ("Нет", "-", "нет") else update.message.text.strip()
+    worker_ids = context.user_data.get("worker_ids", [])
+    if not worker_ids:
+        await update.message.reply_text("Не выбраны работники. Начните заново.", reply_markup=main_keyboard(update.effective_user.id))
+        clear_temp_data(context)
+        return ConversationHandler.END
     async with aiosqlite.connect(DB_PATH) as db:
-        worker_ids = context.user_data.get("worker_ids", [context.user_data.get("worker_id")])
         for wid in worker_ids:
-            if wid is not None:
-                await db.execute(
-                    "INSERT INTO advances (object_id, worker_id, amount, note) VALUES (?, ?, ?, ?)",
-                    (context.user_data["object_id"], wid, context.user_data["amount"], note)
-                )
-                await audit_log(db, update, context, context.user_data["object_id"], "Аванс",
-                                f"Работник ID {wid}; сумма {context.user_data['amount']:+,} ₩; {note or 'без комментария'}")
+            if wid is None:
+                continue
+            await db.execute(
+                "INSERT INTO advances (object_id, worker_id, amount, note) VALUES (?, ?, ?, ?)",
+                (context.user_data["object_id"], wid, context.user_data["amount"], note)
+            )
+            await audit_log(db, update, context, context.user_data["object_id"], "Аванс",
+                            f"Работник ID {wid}; сумма {context.user_data['amount']:+,} ₩; {note or 'без комментария'}")
         await db.commit()
     names = ", ".join(context.user_data.get("worker_names", [])) or "выбранным работникам"
     amount = context.user_data["amount"]
@@ -834,7 +842,7 @@ async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📦 Другое", callback_data="exp_other")],
     ])
     await update.message.reply_text("Выберите категорию расхода:", reply_markup=kb)
-    return EXP_AMOUNT  # после выбора категории сразу сумма
+    return EXP_CATEGORY
 
 
 async def expense_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -850,6 +858,10 @@ async def expense_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
+    if "category" not in context.user_data:
+        await update.message.reply_text("Сначала выберите категорию — нажмите «🧾 Расход» заново.",
+                                        reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
     try:
         amount = int(update.message.text.replace(" ", "").replace(",", ""))
         if amount <= 0:
@@ -878,8 +890,7 @@ async def expense_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.execute(
             "INSERT INTO expenses (object_id, category, amount, description, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?)",
             (context.user_data["object_id"], context.user_data["category"], context.user_data["amount"], desc,
-             update.effective_user.id,
-             " ".join(x for x in [update.effective_user.first_name, update.effective_user.last_name] if x) or update.effective_user.username or str(update.effective_user.id))
+             update.effective_user.id, _user_display_name(update.effective_user))
         )
         await audit_log(db, update, context, context.user_data["object_id"], "Расход",
                         f"Категория: {cat_names.get(context.user_data['category'], context.user_data['category'])}; сумма {context.user_data['amount']:,} ₩; {desc or 'без описания'}")
@@ -899,7 +910,7 @@ async def workers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for w in workers:
         status = "✅" if w["is_active"] else "❌"
         pct = f" + {w['percent']}%" if w["percent"] else ""
-        text += f"{status} <b>{w['name']}</b> — {w['daily_rate']:,} ₩/день{pct}\n"
+        text += f"{status} <b>{escape(w['name'])}</b> — {w['daily_rate']:,} ₩/день{pct}\n"
     kb = None
     if is_admin(update.effective_user.id):
         kb = InlineKeyboardMarkup([
@@ -911,10 +922,8 @@ async def workers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Вход в диалог добавления работника (только через ConversationHandler)."""
     query = update.callback_query
     await query.answer()
-    # сохраняем бригаду, чистим временные поля прошлого диалога
     keep = context.user_data.get("active_brigade_id")
     for k in list(context.user_data.keys()):
         if k != "active_brigade_id":
@@ -967,11 +976,10 @@ async def worker_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text("Работник не найден.")
             return
         name = row[0]
-        # Деактивируем (история сохраняется)
         await db.execute("UPDATE workers SET is_active = 0 WHERE id = ?", (wid,))
         await db.commit()
     await query.message.reply_text(
-        f"✅ Работник <b>{name}</b> удалён из списка.\n"
+        f"✅ Работник <b>{escape(name)}</b> удалён из списка.\n"
         "(История его дней и авансов сохранена)",
         parse_mode="HTML",
         reply_markup=main_keyboard(query.from_user.id)
@@ -1026,20 +1034,23 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await db.commit()
         except aiosqlite.IntegrityError:
             await update.message.reply_text("Такое имя уже есть.")
+            keep = context.user_data.get("active_brigade_id")
+            clear_temp_data(context)
+            if keep:
+                context.user_data["active_brigade_id"] = keep
             return ConversationHandler.END
     name = context.user_data.get("new_name", "")
     rate = context.user_data.get("new_rate", 0)
     await update.message.reply_text(
-        f"✅ {name} добавлен: {rate:,} ₩ + {pct}%",
-        reply_markup=main_keyboard(update.effective_user.id)
+        f"✅ {escape(name)} добавлен: {rate:,} ₩ + {pct}%",
+        reply_markup=main_keyboard(update.effective_user.id),
+        parse_mode="HTML"
     )
     keep = context.user_data.get("active_brigade_id")
     clear_temp_data(context)
     if keep:
         context.user_data["active_brigade_id"] = keep
     return ConversationHandler.END
-
-
 
 
 async def worker_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1070,11 +1081,12 @@ async def worker_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker_label = worker[0]
         current_label = f"Текущая ставка: {worker[1]:,} ₩/день\nТекущий процент: {worker[2]}%"
     await query.message.reply_text(
-        f"Работник: {worker_label}\n{current_label}\n\n"
+        f"Работник: {escape(worker_label)}\n{escape(current_label)}\n\n"
         "Введите новую дневную ставку и процент через пробел.\n"
         "Например: 170000 20\n"
         "Если процент не нужен, укажите 0.",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True),
+        parse_mode="HTML"
     )
     return EDIT_W_VALUE
 
@@ -1087,7 +1099,6 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите два значения через пробел, например: 170000 20")
         return EDIT_W_VALUE
     try:
-        # Ставка целая; допускаем ввод 170,000 или 170000.
         rate_text = parts[0].replace(",", "")
         rate = int(rate_text)
         percent = float(parts[1].replace(",", "."))
@@ -1113,7 +1124,10 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.commit()
         if cur.rowcount == 0:
             await update.message.reply_text("Не удалось изменить: работники не найдены в текущей бригаде.")
+            keep = context.user_data.get("active_brigade_id")
             clear_temp_data(context)
+            if keep:
+                context.user_data["active_brigade_id"] = keep
             return ConversationHandler.END
 
     target_label = "у всех активных работников" if context.user_data.get("edit_all_workers") else "у работника"
@@ -1130,7 +1144,6 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== КОРРЕКТИРОВКА ДНЕЙ ==================
 async def corr_show_workers(message, context, user_id):
-    """Показывает мультивыбор работников для корректировки."""
     workers = await get_workers(get_user_brigade_id(user_id, context))
     selected = context.user_data.setdefault("corr_selected", set())
     buttons, row = [], []
@@ -1156,12 +1169,9 @@ async def corr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала создайте объект.")
         return ConversationHandler.END
     context.user_data["object_id"] = obj["id"]
-    await update.message.reply_text(
-        "✅ Корректировка выбранных работников завершена.",
-        reply_markup=main_keyboard(update.effective_user.id)
-    )
-    clear_temp_data(context)
-    return ConversationHandler.END
+    context.user_data["corr_selected"] = set()
+    await corr_show_workers(update.message, context, update.effective_user.id)
+    return CORR_WORKER
 
 
 async def corr_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1219,10 +1229,11 @@ async def corr_prompt_current(message, context):
     context.user_data["worker_id"] = worker["id"]
     context.user_data["worker_name"] = worker["name"]
     await message.reply_text(
-        f"<b>{worker['name']}</b> — сейчас дней: <b>{total:g}</b>\n"
+        f"<b>{escape(worker['name'])}</b> — сейчас дней: <b>{total:g}</b>\n"
         f"Работник {idx + 1} из {len(queue)}.\n\n"
         "Введите изменение дней: <code>1</code>, <code>0.5</code>, "
-        "<code>-1</code> или <code>-0.5</code>. Чтобы не менять, введите <code>0</code>.",
+        "<code>-1</code> или <code>-0.5</code>. Чтобы не менять, введите <code>0</code>.\n\n"
+        "Корректировка применяется к сегодняшнему дню.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
@@ -1268,7 +1279,7 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sign = "+" if delta > 0 else ""
     await update.message.reply_text(
-        f"✅ {name}: {sign}{delta:g} дн.\nТеперь всего дней: <b>{total:g}</b>",
+        f"✅ {escape(name)}: {sign}{delta:g} дн.\nТеперь всего дней: <b>{total:g}</b>",
         parse_mode="HTML"
     )
     context.user_data["corr_index"] += 1
@@ -1305,6 +1316,7 @@ async def receipt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = int(update.message.text.replace(" ", "").replace(",", ""))
         if amount == 0:
             raise ValueError
+
     except ValueError:
         await update.message.reply_text("Введите целое число, отличное от нуля. Плюс добавляет поступление, минус уменьшает.")
         return RCPT_AMOUNT
@@ -1361,8 +1373,9 @@ async def overtime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     workers = await get_workers(get_user_brigade_id(update.effective_user.id, context))
     buttons = [[InlineKeyboardButton(w["name"], callback_data=f"otw_{w['id']}")] for w in workers]
     buttons.append([InlineKeyboardButton("👥 Всем работникам", callback_data="otw_all")])
+    ot_rate = await get_setting("ot_rate", str(DEFAULT_OT_RATE))
     await update.message.reply_text(
-        "Кому добавить сверхурочные? Можно выбрать одного или сразу всех.\n(1 час = 20 000 ₩)",
+        f"Кому добавить сверхурочные? Можно выбрать одного или сразу всех.\n(1 час = {int(float(ot_rate)):,} ₩)",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
     return OT_WORKER
@@ -1401,7 +1414,11 @@ async def overtime_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите положительное число.")
         return OT_HOURS
     object_id = context.user_data["object_id"]
-    worker_ids = context.user_data.get("worker_ids", [context.user_data.get("worker_id")])
+    worker_ids = context.user_data.get("worker_ids", [])
+    if not worker_ids:
+        await update.message.reply_text("Не выбраны работники.", reply_markup=main_keyboard(update.effective_user.id))
+        clear_temp_data(context)
+        return ConversationHandler.END
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         for worker_id in worker_ids:
@@ -1419,18 +1436,20 @@ async def overtime_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, 0, ?)",
                     (object_id, worker_id, today, hours)
                 )
+        await audit_log(db, update, context, object_id, "Сверхурочные",
+                        f"Часы {hours:g}; работники: {', '.join(context.user_data.get('worker_names', []))}")
         await db.commit()
     ot_rate = int(float(await get_setting("ot_rate", str(DEFAULT_OT_RATE))))
     pay = int(hours * ot_rate)
     await update.message.reply_text(
-        f"✅ Каждому из выбранных работников ({', '.join(context.user_data.get('worker_names', []))}): +{hours:g} ч сверхурочных (+{pay:,} ₩ на человека)",
+        f"✅ Каждому из выбранных ({', '.join(context.user_data.get('worker_names', []))}): +{hours:g} ч (+{pay:,} ₩ на человека)",
         reply_markup=main_keyboard(update.effective_user.id)
     )
     clear_temp_data(context)
     return ConversationHandler.END
 
 
-# ================== ОТЧЁТ ==================
+# ================== ИСТОРИЯ ОПЕРАЦИЙ ==================
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brigade_id = get_user_brigade_id(update.effective_user.id, context)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1444,7 +1463,7 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ) as cur:
             rows = await cur.fetchall()
     if not rows:
-        await update.message.reply_text("История пока пустая. Новые расходы, авансы и поступления будут записываться сюда.")
+        await update.message.reply_text("История пока пустая.")
         return
     lines = ["<b>🕘 История операций (последние 40)</b>", ""]
     for r in rows:
@@ -1455,13 +1474,49 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(escape(str(r["details"])))
         lines.append("")
     text = "\n".join(lines)
-    # Telegram message limit safety: show newest entries and keep below ~3900 chars.
-    await update.message.reply_text(text[:3900], parse_mode="HTML")
+    if len(text) > 3900:
+        cut = text.rfind("\n", 0, 3900)
+        text = text[:cut] if cut > 0 else text[:3900]
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
-EXPENSE_HISTORY_DATE = 90
+async def edit_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brigade_id = get_user_brigade_id(update.effective_user.id, context)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT h.created_at, h.user_name, h.table_name, h.field,
+                      h.old_value, h.new_value, o.name AS object_name
+               FROM edit_history h LEFT JOIN objects o ON o.id = h.object_id
+               WHERE h.brigade_id = ? ORDER BY h.id DESC LIMIT 30""",
+            (brigade_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text("Правок ещё не было.")
+        return
+    table_ru = {"expenses": "Расход", "advances": "Аванс", "receipts": "Поступление",
+                "work_logs": "Дни/OT", "objects": "Объект"}
+    field_ru = {"amount": "сумма", "description": "описание", "note": "комментарий",
+                "days": "дни", "overtime_hours": "часы OT", "total_sum": "сумма объекта"}
+    lines = ["<b>✏️ История правок (последние 30)</b>", ""]
+    for r in rows:
+        tname = table_ru.get(r["table_name"], r["table_name"])
+        fname = field_ru.get(r["field"], r["field"])
+        obj = r["object_name"] or "—"
+        lines.append(f"<b>{escape(str(r['created_at']))}</b> · {escape(r['user_name'] or '—')}")
+        lines.append(f"{escape(tname)} · {escape(fname)} · объект: {escape(obj)}")
+        lines.append(f"  Было: {escape(str(r['old_value'] or '—'))}")
+        lines.append(f"  Стало: {escape(str(r['new_value'] or '—'))}")
+        lines.append("")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        cut = text.rfind("\n", 0, 3900)
+        text = text[:cut] if cut > 0 else text[:3900]
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
+# ================== РАСХОДЫ ПО ДНЯМ ==================
 async def expense_history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
     if not obj:
@@ -1475,7 +1530,7 @@ async def expense_history_start(update: Update, context: ContextTypes.DEFAULT_TY
         "❌ Отмена — вернуться в меню.",
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Сегодня"), KeyboardButton("7 дней")], [KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
-    return EXPENSE_HISTORY_DATE
+    return DAILY_PICK_DATE
 
 
 async def expense_history_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1488,27 +1543,25 @@ async def expense_history_show(update: Update, context: ContextTypes.DEFAULT_TYP
     if raw.lower() == "сегодня":
         start_day = end_day = today
     elif raw.lower() in ("7 дней", "7дней"):
-        from datetime import timedelta
         start_day, end_day = today - timedelta(days=6), today
     else:
         try:
             start_day = end_day = datetime.strptime(raw, "%Y-%m-%d").date()
         except ValueError:
             await update.message.reply_text("Не понял дату. Напиши, например, 2026-10-22, или выбери «Сегодня» / «7 дней».")
-            return EXPENSE_HISTORY_DATE
+            return DAILY_PICK_DATE
 
     brigade_id = get_user_brigade_id(update.effective_user.id, context)
     object_id = context.user_data.get("expense_history_object_id")
     cat_names = {"food": "Питание", "transport": "Дорога", "housing": "Проживание", "technician": "Техника", "other": "Другое"}
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        params = [brigade_id, start_day.isoformat(), end_day.isoformat()]
-        object_filter = "AND e.object_id = ?"
-        params.append(object_id)
+        params = [brigade_id, start_day.isoformat(), end_day.isoformat(), object_id]
         async with db.execute(
             """SELECT e.created_at, e.category, e.amount, e.description, e.user_name, o.name AS object_name
                FROM expenses e JOIN objects o ON o.id=e.object_id
-               WHERE o.brigade_id=? AND date(e.created_at) BETWEEN date(?) AND date(?) """ + object_filter + " ORDER BY e.created_at, e.id",
+               WHERE o.brigade_id=? AND date(e.created_at) BETWEEN date(?) AND date(?) AND e.object_id = ?
+               ORDER BY e.created_at, e.id""",
             params
         ) as cur:
             rows = await cur.fetchall()
@@ -1553,7 +1606,6 @@ async def expense_history_show(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"• {escape(cat_names.get(cat, cat))}: {cat_total:,} ₩")
     lines.append(f"<b>ИТОГО ЗА ПЕРИОД: {grand_total:,} ₩</b>")
     output = "\n".join(lines)
-    # Telegram limits message size; split by day/sections without cutting HTML tags.
     if len(output) <= 3900:
         await update.message.reply_text(output, parse_mode="HTML", reply_markup=main_keyboard(update.effective_user.id))
     else:
@@ -1569,340 +1621,295 @@ async def expense_history_show(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== ВСЁ ПО ДНЯМ ==================
+async def daily_view_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
     if not obj:
-        await update.message.reply_text("Нет активного объекта.")
-        return
-    brigade_id = get_user_brigade_id(update.effective_user.id, context)
-    report = await generate_report(obj["id"], brigade_id)
-    await update.message.reply_text(report, parse_mode="HTML")
-
-
-async def generate_report(object_id: int, brigade_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM objects WHERE id = ?", (object_id,)) as cur:
-            obj = dict(await cur.fetchone())
-        workers = await get_workers(brigade_id, active_only=False)
-        worker_map = {w["id"]: w for w in workers}
-
-        async with db.execute(
-            "SELECT worker_id, SUM(days) as total_days, SUM(overtime_hours) as total_ot FROM work_logs WHERE object_id = ? GROUP BY worker_id",
-            (object_id,)
-        ) as cur:
-            logs = [dict(r) for r in await cur.fetchall()]
-
-        ot_rate = int(float(await get_setting("ot_rate", str(DEFAULT_OT_RATE))))
-        wages = {}
-        days_info = {}
-        total_wages = 0
-        for log in logs:
-            wid = log["worker_id"]
-            w = worker_map.get(wid)
-            if not w:
-                continue
-            days = log["total_days"] or 0
-            ot = log["total_ot"] or 0
-            base = days * w["daily_rate"]
-            ot_pay = ot * ot_rate
-            amount = int(base + ot_pay)
-            wages[wid] = amount
-            days_info[wid] = (days, ot)
-            total_wages += amount
-
-        async with db.execute("SELECT category, SUM(amount) as s FROM expenses WHERE object_id = ? GROUP BY category", (object_id,)) as cur:
-            exp_by_cat = {r["category"]: r["s"] for r in await cur.fetchall()}
-        total_expenses = sum(exp_by_cat.values())
-
-        async with db.execute("SELECT worker_id, SUM(amount) as s FROM advances WHERE object_id = ? GROUP BY worker_id", (object_id,)) as cur:
-            advances = {r["worker_id"]: r["s"] for r in await cur.fetchall()}
-
-        async with db.execute("SELECT COALESCE(SUM(amount),0) FROM receipts WHERE object_id = ?", (object_id,)) as cur:
-            total_received = (await cur.fetchone())[0] or 0
-
-        work_type = obj.get("work_type") or "profit"
-        is_daily = work_type == "daily"
-
-        revenue = obj["total_sum"] or 0
-        profit = 0 if is_daily else (revenue - total_wages - total_expenses)
-
-        profit_share = {}
-        for w in workers:
-            if is_daily:
-                profit_share[w["id"]] = 0
-            else:
-                profit_share[w["id"]] = int(profit * w["percent"] / 100) if w["percent"] and profit > 0 else 0
-
-        type_label = "📅 Работа за илтан" if is_daily else "💰 С прибылью"
-        lines = [
-            f"<b>📋 ОТЧЁТ: {escape(str(obj['name']))}</b>",
-            f"Тип: {type_label}",
-            f"Статус: {obj['status']}",
-            "",
-        ]
-        if revenue:
-            lines.append(f"💰 <b>Сумма объекта:</b> {revenue:,} ₩")
-        if total_received or revenue:
-            lines.append(f"💵 <b>Получено от заказчика:</b> {total_received:,} ₩")
-            if revenue:
-                lines.append(f"📉 <b>Осталось получить:</b> {revenue - total_received:,} ₩")
-        lines.append(f"👷 <b>Зарплаты (всего):</b> {total_wages:,} ₩")
-        lines.append(f"🧾 <b>Расходы (всего):</b> {total_expenses:,} ₩")
-        cat_names = {"food": "Питание", "transport": "Дорога", "housing": "Проживание", "technician": "Техника", "other": "Другое"}
-        for c in ("food", "transport", "housing", "technician", "other"):
-            lines.append(f"   • {cat_names[c]}: {exp_by_cat.get(c, 0):,} ₩")
-        if not is_daily:
-            lines.append(f"📈 <b>Прибыль (остаток):</b> {profit:,} ₩")
-        lines += [
-            "",
-            "<b>Выплаты работникам:</b>",
-            "─" * 20,
-        ]
-
-        grand_total = 0
-        for w in sorted(workers, key=lambda x: -(x["percent"] or 0)):
-            wid = w["id"]
-            wage = wages.get(wid, 0)
-            share = profit_share.get(wid, 0)
-            adv = advances.get(wid, 0)
-            to_pay = wage + share - adv
-            if days_info.get(wid, (0, 0))[0] == 0 and share == 0 and adv == 0:
-                continue
-            grand_total += max(to_pay, 0)
-            days, ot = days_info.get(wid, (0, 0))
-            lines.append(f"<b>{escape(str(w['name']))}</b>")
-            if days:
-                lines.append(f"  Дней: {days:g}" + (f" + {ot:g} ч сверхурочно" if ot else ""))
-                lines.append(f"  Зарплата: {wage:,} ₩")
-            if share:
-                lines.append(f"  Доля прибыли ({w['percent']}%): {share:,} ₩")
-            if adv > 0:
-                lines.append(f"  Авансы: −{adv:,} ₩")
-            elif adv < 0:
-                lines.append(f"  Возврат аванса: +{abs(adv):,} ₩")
-            lines.append(f"  <b>К выплате: {to_pay:,} ₩</b>")
-            lines.append("")
-
-        lines.append("─" * 20)
-        lines.append(f"<b>Итого к выплате: {grand_total:,} ₩</b>")
-        if not is_daily and profit < 0:
-            lines.append("\n⚠️ Прибыль отрицательная.")
-        return "\n".join(lines)
-
-
-# ================== НАСТРОЙКИ ==================
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Нет доступа.")
-        return
-    rate = await get_setting("ot_rate", str(DEFAULT_OT_RATE))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Сверхурочные: {int(float(rate)):,} ₩/час", callback_data="set_ot")]])
-    await update.message.reply_text("Настройки:", reply_markup=kb)
-
-
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "set_ot":
-        await query.message.reply_text(
-            "Введите оплату за 1 час сверхурочных в вонах\n(например 20000 или 30000):",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        await update.message.reply_text("Сначала создайте объект.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    context.user_data["daily_obj_id"] = obj["id"]
+    await update.message.reply_text(
+        "📆 За какой день показать всё?\n\n"
+        "Напиши дату ГГГГ-ММ-ДД, «Сегодня», «Вчера» или «7 дней».",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("Сегодня"), KeyboardButton("Вчера")],
+             [KeyboardButton("7 дней"), KeyboardButton("❌ Отмена")]],
+            resize_keyboard=True
         )
-        return OT_COEFF
+    )
+    return DAILY_PICK_DATE
 
 
-async def set_ot_coeff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def daily_view_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
-    try:
-        val = int(update.message.text.replace(" ", "").replace(",", ""))
-        if val <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите целое положительное число.")
-        return OT_COEFF
-    await set_setting("ot_rate", str(val))
-    await update.message.reply_text(f"✅ Сверхурочные: {val:,} ₩/час", reply_markup=main_keyboard(update.effective_user.id))
+    raw = update.message.text.strip().lower()
+    today = date.today()
+    if raw == "сегодня":
+        start = end = today
+    elif raw == "вчера":
+        start = end = today - timedelta(days=1)
+    elif raw in ("7 дней", "7дней"):
+        start, end = today - timedelta(days=6), today
+    else:
+        try:
+            start = end = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            await update.message.reply_text("Не понял дату. Пример: 2026-10-22")
+            return DAILY_PICK_DATE
+
+    object_id = context.user_data["daily_obj_id"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT l.work_date, w.name AS wname, l.days, l.overtime_hours, l.updated_at "
+            "FROM work_logs l JOIN workers w ON w.id=l.worker_id "
+            "WHERE l.object_id=? AND l.work_date BETWEEN ? AND ? ORDER BY l.work_date, w.name",
+            (object_id, start.isoformat(), end.isoformat())
+        ) as cur:
+            logs = await cur.fetchall()
+        async with db.execute(
+            "SELECT a.created_at, w.name AS wname, a.amount, a.note, a.updated_at "
+            "FROM advances a JOIN workers w ON w.id=a.worker_id "
+            "WHERE a.object_id=? AND date(a.created_at) BETWEEN ? AND ? ORDER BY a.created_at",
+            (object_id, start.isoformat(), end.isoformat())
+        ) as cur:
+            advances = await cur.fetchall()
+        async with db.execute(
+            "SELECT e.created_at, e.category, e.amount, e.description, e.user_name, e.updated_at "
+            "FROM expenses e WHERE e.object_id=? AND date(e.created_at) BETWEEN ? AND ? ORDER BY e.created_at",
+            (object_id, start.isoformat(), end.isoformat())
+        ) as cur:
+            expenses = await cur.fetchall()
+        async with db.execute(
+            "SELECT r.created_at, r.amount, r.note, r.updated_at "
+            "FROM receipts r WHERE r.object_id=? AND date(r.created_at) BETWEEN ? AND ? ORDER BY r.created_at",
+            (object_id, start.isoformat(), end.isoformat())
+        ) as cur:
+            receipts = await cur.fetchall()
+
+    cat_names = {"food": "Питание", "transport": "Дорога", "housing": "Проживание", "technician": "Техника", "other": "Другое"}
+    lines = [f"📆 <b>Всё по дням: {start.isoformat()} — {end.isoformat()}</b>", ""]
+    has_any = False
+    if logs:
+        has_any = True
+        lines.append("<b>📅 Рабочие дни:</b>")
+        for r in logs:
+            ot = f" + {r['overtime_hours']:g} ч OT" if r["overtime_hours"] else ""
+            edited = " (правка)" if r["updated_at"] else ""
+            lines.append(f"  • {r['work_date']} · {escape(r['wname'])}: {r['days']:g} дн.{ot}{edited}")
+        lines.append("")
+    if expenses:
+        has_any = True
+        lines.append("<b>🧾 Расходы:</b>")
+        for r in expenses:
+            edited = " (правка)" if r["updated_at"] else ""
+            cat = cat_names.get(r["category"], r["category"])
+            desc = r["description"] or "—"
+            lines.append(f"  • {str(r['created_at'])[:16]} · {escape(cat)} — {r['amount']:,} ₩ · {escape(r['user_name'] or '—')} · {escape(desc)}{edited}")
+        lines.append("")
+    if advances:
+        has_any = True
+        lines.append("<b>💰 Авансы:</b>")
+        for r in advances:
+            edited = " (правка)" if r["updated_at"] else ""
+            lines.append(f"  • {str(r['created_at'])[:16]} · {escape(r['wname'])}: {r['amount']:+,} ₩ · {escape(r['note'] or '—')}{edited}")
+        lines.append("")
+    if receipts:
+        has_any = True
+        lines.append("<b>💵 Поступления:</b>")
+        for r in receipts:
+            edited = " (правка)" if r["updated_at"] else ""
+            lines.append(f"  • {str(r['created_at'])[:16]} · {r['amount']:+,} ₩ · {escape(r['note'] or '—')}{edited}")
+        lines.append("")
+    if not has_any:
+        await update.message.reply_text("За этот период записей нет.", reply_markup=main_keyboard(update.effective_user.id))
+        clear_temp_data(context)
+        return ConversationHandler.END
+    output = "\n".join(lines)
+    if len(output) > 3900:
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3500:
+                await update.message.reply_text(chunk, parse_mode="HTML")
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            await update.message.reply_text(chunk, parse_mode="HTML", reply_markup=main_keyboard(update.effective_user.id))
+    else:
+        await update.message.reply_text(output, parse_mode="HTML", reply_markup=main_keyboard(update.effective_user.id))
+    clear_temp_data(context)
     return ConversationHandler.END
 
 
-# ================== ЗАПУСК ==================
-async def post_init(app: Application):
-    await init_db()
+# ================== РЕДАКТИРОВАНИЕ ЗАПИСЕЙ ==================
+async def edit_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
+    if not obj:
+        await update.message.reply_text("Сначала создайте объект.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    context.user_data["edit_object_id"] = obj["id"]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧾 Расходы", callback_data="editcat_exp")],
+        [InlineKeyboardButton("💰 Авансы", callback_data="editcat_adv")],
+        [InlineKeyboardButton("💵 Поступления", callback_data="editcat_rcpt")],
+        [InlineKeyboardButton("📅 Рабочие дни", callback_data="editcat_log")],
+        [InlineKeyboardButton("➕ Сверхурочные", callback_data="editcat_ot")],
+    ])
+    await update.message.reply_text(
+        f"Объект: <b>{escape(obj['name'])}</b>\nЧто редактируем?",
+        reply_markup=kb, parse_mode="HTML"
+    )
+    return EDIT_MENU
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN. Добавьте токен бота в Railway → Variables → BOT_TOKEN."
+async def edit_pick_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    object_id = context.user_data["edit_object_id"]
+
+    if data.startswith("editcat_"):
+        cat = data.split("_", 1)[1]
+        context.user_data["edit_table"] = cat
+        rows = []
+        labels = []
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            if cat == "exp":
+                async with db.execute(
+                    "SELECT id, category, amount, description, created_at FROM expenses "
+                    "WHERE object_id=? ORDER BY id DESC LIMIT 30", (object_id,)
+                ) as cur:
+                    rows = await cur.fetchall()
+                for r in rows:
+                    labels.append(f"🧾 {r['category']} — {r['amount']:,} ₩ ({str(r['created_at'])[:16]})")
+            elif cat == "adv":
+                async with db.execute(
+                    "SELECT a.id, w.name AS wname, a.amount, a.created_at FROM advances a "
+                    "JOIN workers w ON w.id=a.worker_id "
+                    "WHERE a.object_id=? ORDER BY a.id DESC LIMIT 30", (object_id,)
+                ) as cur:
+                    rows = await cur.fetchall()
+                for r in rows:
+                    labels.append(f"💰 {r['wname']} — {r['amount']:+,} ₩ ({str(r['created_at'])[:16]})")
+            elif cat == "rcpt":
+                async with db.execute(
+                    "SELECT id, amount, created_at FROM receipts "
+                    "WHERE object_id=? ORDER BY id DESC LIMIT 30", (object_id,)
+                ) as cur:
+                    rows = await cur.fetchall()
+                for r in rows:
+                    labels.append(f"💵 {r['amount']:+,} ₩ ({str(r['created_at'])[:16]})")
+            elif cat == "log":
+                async with db.execute(
+                    "SELECT l.id, w.name AS wname, l.work_date, l.days FROM work_logs l "
+                    "JOIN workers w ON w.id=l.worker_id "
+                    "WHERE l.object_id=? ORDER BY l.work_date DESC LIMIT 30", (object_id,)
+                ) as cur:
+                    rows = await cur.fetchall()
+                for r in rows:
+                    labels.append(f"📅 {r['work_date']} · {r['wname']} — {r['days']:g} дн.")
+            elif cat == "ot":
+                async with db.execute(
+                    "SELECT l.id, w.name AS wname, l.work_date, l.overtime_hours FROM work_logs l "
+                    "JOIN workers w ON w.id=l.worker_id "
+                    "WHERE l.object_id=? AND l.overtime_hours>0 ORDER BY l.work_date DESC LIMIT 30", (object_id,)
+                ) as cur:
+                    rows = await cur.fetchall()
+                for r in rows:
+                    labels.append(f"➕ {r['work_date']} · {r['wname']} — {r['overtime_hours']:g} ч")
+        if not rows:
+            await query.message.reply_text("Нет записей для редактирования.", reply_markup=main_keyboard(query.from_user.id))
+            clear_temp_data(context)
+            return ConversationHandler.END
+        buttons = [[InlineKeyboardButton(lbl, callback_data=f"editid_{cat}_{r['id']}")] for lbl, r in zip(labels, rows)]
+        await query.message.reply_text("Выберите запись:", reply_markup=InlineKeyboardMarkup(buttons))
+        return EDIT_PICK_RECORD
+
+    if data.startswith("editid_"):
+        parts = data.split("_")
+        cat = parts[1]
+        rid = int(parts[2])
+        context.user_data["edit_row_id"] = rid
+        context.user_data["edit_cat"] = cat
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            old_label = ""
+            if cat == "exp":
+                async with db.execute("SELECT * FROM expenses WHERE id=?", (rid,)) as cur:
+                    r = await cur.fetchone()
+                old_label = f"Категория: {r['category']}\nСумма: {r['amount']:,} ₩\nОписание: {r['description'] or '—'}"
+            elif cat == "adv":
+                async with db.execute("SELECT * FROM advances WHERE id=?", (rid,)) as cur:
+                    r = await cur.fetchone()
+                old_label = f"Сумма: {r['amount']:+,} ₩\nКомментарий: {r['note'] or '—'}"
+            elif cat == "rcpt":
+                async with db.execute("SELECT * FROM receipts WHERE id=?", (rid,)) as cur:
+                    r = await cur.fetchone()
+                old_label = f"Сумма: {r['amount']:+,} ₩\nКомментарий: {r['note'] or '—'}"
+            elif cat == "log":
+                async with db.execute("SELECT * FROM work_logs WHERE id=?", (rid,)) as cur:
+                    r = await cur.fetchone()
+                old_label = f"Дата: {r['work_date']}\nДни: {r['days']:g}"
+            elif cat == "ot":
+                async with db.execute("SELECT * FROM work_logs WHERE id=?", (rid,)) as cur:
+                    r = await cur.fetchone()
+                old_label = f"Дата: {r['work_date']}\nСверхурочные: {r['overtime_hours']:g} ч"
+        prompt = {
+            "exp": "Введите новую сумму и описание через |, например: 50000 | обед",
+            "adv": "Введите новую сумму (можно с минусом) и комментарий через |, например: 30000 | аванс",
+            "rcpt": "Введите новую сумму и комментарий через |, например: 100000 | оплата",
+            "log": "Введите новое количество дней (например 1, 0.5, 0):",
+            "ot": "Введите новое количество часов (например 2, 1.5, 0):",
+        }[cat]
+        await query.message.reply_text(
+            f"<b>Текущее значение:</b>\n{escape(old_label)}\n\n{prompt}",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
         )
-    if not SUPER_ADMIN_IDS:
-        raise RuntimeError(
-            "Не задан SUPER_ADMIN_IDS. Добавьте свой Telegram ID в Railway → Variables → SUPER_ADMIN_IDS."
-        )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Защита: только люди из ADMIN_IDS
-    app.add_handler(TypeHandler(Update, access_guard), group=-1)
-
-    # Простые команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^📊 Отчёт$"), report_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^🕘 История операций$"), history_cmd))
-    app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📅 Расходы по дням$"), expense_history_start)],
-        states={EXPENSE_HISTORY_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_history_show)]},
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-        allow_reentry=True,
-    ))
-    app.add_handler(MessageHandler(filters.Regex("^👷 Работники$"), workers_menu))
-    app.add_handler(MessageHandler(filters.Regex("^🏗️ Объект$"), object_menu))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), settings_menu))
-    app.add_handler(MessageHandler(filters.Regex("^🔄 Сменить бригаду$"), switch_brigade_menu))
-    app.add_handler(CallbackQueryHandler(switch_brigade_callback, pattern="^swbrig_"))
-
-    # Объект
-    # Общий обработчик объектов (кроме создания и суммы — их ловят ConversationHandler)
-    app.add_handler(CallbackQueryHandler(obj_callback, pattern="^obj_(info|close|close_yes|close_no)$"))
-    app.add_handler(CallbackQueryHandler(workers_callback, pattern="^w_(edit|delete)$"))
-    app.add_handler(CallbackQueryHandler(worker_delete_confirm, pattern="^wdel_"))
-
-    # Корректировка дней
-    conv_corr = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^✏️ Корректировка дней$"), corr_start)],
-        states={
-            CORR_WORKER: [CallbackQueryHandler(corr_worker, pattern="^corrw_"), CallbackQueryHandler(corr_done, pattern="^corr_done$")],
-            CORR_DELTA: [MessageHandler(filters.TEXT & ~filters.COMMAND, corr_delta)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_corr)
-
-    # Отметить день
-    conv_mark = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📅 Отметить день$"), mark_day_start)],
-        states={
-            MARK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mark_date)],
-            MARK_WORKERS: [CallbackQueryHandler(mark_workers_callback, pattern="^wd_")],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_mark)
-
-    # Сверхурочные
-    conv_ot = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Сверхурочные$"), overtime_start)],
-        states={
-            OT_WORKER: [CallbackQueryHandler(overtime_worker, pattern=r"^otw_(all|\d+)$")],
-            OT_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, overtime_hours)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_ot)
-
-    # Поступление от заказчика
-    conv_rcpt = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^💵 Поступление$"), receipt_start)],
-        states={
-            RCPT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_amount)],
-            RCPT_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_note)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_rcpt)
-
-    # Аванс работнику
-    conv_adv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^💰 Аванс работнику$"), advance_start)],
-        states={
-            ADV_WORKER: [CallbackQueryHandler(advance_worker, pattern=r"^adv_(all|\d+)$")],
-            ADV_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, advance_amount)],
-            ADV_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, advance_note)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_adv)
-
-    # Расход
-    conv_exp = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🧾 Расход$"), expense_start)],
-        states={
-            EXP_AMOUNT: [
-                CallbackQueryHandler(expense_cat, pattern="^exp_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount),
-            ],
-            EXP_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_desc)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_exp)
-
-    # Добавление работника
-    conv_add_w = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_add_worker, pattern="^w_add$")],
-        states={
-            ADD_W_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_name)],
-            ADD_W_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_rate)],
-            ADD_W_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_worker_percent)],
-        },
-        fallbacks=[
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_add_w)
-
-    # Изменение дневной ставки и процента работника
-    conv_edit_w = ConversationHandler(
-        entry_points=[CallbackQueryHandler(worker_edit_start, pattern=r"^wedit_(all|\d+)$")],
-        states={
-            EDIT_W_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, worker_edit_value)],
-        },
-        fallbacks=[
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_edit_w)
-
-    # Настройки
-    conv_set = ConversationHandler(
-        entry_points=[CallbackQueryHandler(settings_callback, pattern="^set_ot$")],
-        states={OT_COEFF: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_ot_coeff)]},
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_set)
-
-    # Создание объекта
-    conv_obj = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_new_object, pattern="^obj_new$")],
-        states={
-            OBJ_TYPE: [CallbackQueryHandler(choose_work_type, pattern="^type_")],
-            OBJ_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, obj_name)],
-        },
-        fallbacks=[
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_obj)
-
-    # Установка суммы
-    conv_sum = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_set_sum, pattern="^obj_set_sum$")],
-        states={OBJ_SUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, obj_sum)]},
-        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
-    )
-    app.add_handler(conv_sum)
-
-    print("Бот запущен...")
-    app.run_polling()
+        return EDIT_NEW_VALUE
+    return EDIT_PICK_RECORD
 
 
-if __name__ == "__main__":
-    main()
+async def edit_apply_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Отмена":
+        return await cancel(update, context)
+    cat = context.user_data.get("edit_cat")
+    rid = context.user_data.get("edit_row_id")
+    if cat is None or rid is None:
+        await update.message.reply_text("Что-то пошло не так, начните заново.", reply_markup=main_keyboard(update.effective_user.id))
+        clear_temp_data(context)
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    user = update.effective_user
+    brigade_id = get_user_brigade_id(user.id, context)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        try:
+            if cat == "exp":
+                parts = [p.strip() for p in text.split("|", 1)]
+                amount = int(parts[0].replace(" ", "").replace(",", ""))
+                desc = parts[1] if len(parts) > 1 else ""
+                if amount <= 0:
+                    raise ValueError("Сумма должна быть > 0")
+                async with db.execute("SELECT * FROM expenses WHERE id=?", (rid,)) as cur:
+                    old = await cur.fetchone()
+                await db.execute(
+                    "UPDATE expenses SET amount=?, description=?, updated_at=?, updated_by=? WHERE id=?",
+                    (amount, desc, now, user.id, rid)
+                )
+                await log_edit(db, brigade_id, old["object_id"], "expenses", rid, "amount", old["amount"], amount, user)
+                await log_edit(db, brigade_id, old["object_id"], "expenses", rid, "description", old["description"] or "", desc, user)
+            elif cat == "adv":
+                parts = [p.strip() for p in text.split("|", 1)]
+                amount = int(parts[0].replace(" ", "").replace(",", ""))
+                note = parts[1] if len(parts) > 1 else ""
+                if amount == 0:
+                    raise ValueError("Сумма не может быть 0")
+                async with db.execute("SELECT * FROM advances WHERE id=?", (rid,)) as cur:
+                    old = await cur.fetchone()
+                await db.execute(
+                    "UPDATE advances SET amount=?, note=
