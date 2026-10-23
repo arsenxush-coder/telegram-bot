@@ -1156,12 +1156,9 @@ async def corr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала создайте объект.")
         return ConversationHandler.END
     context.user_data["object_id"] = obj["id"]
-    await update.message.reply_text(
-        "✅ Корректировка выбранных работников завершена.",
-        reply_markup=main_keyboard(update.effective_user.id)
-    )
-    clear_temp_data(context)
-    return ConversationHandler.END
+    context.user_data["corr_selected"] = set()
+    await corr_show_workers(update.message, context, update.effective_user.id)
+    return CORR_WORKER
 
 
 async def corr_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1243,32 +1240,74 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker_id = context.user_data["worker_id"]
     name = context.user_data["worker_name"]
     today = date.today().isoformat()
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, days FROM work_logs WHERE object_id=? AND worker_id=? AND work_date=?",
-            (object_id, worker_id, today)
-        ) as cur:
-            row = await cur.fetchone()
-        if row:
-            new_days = max(0, (row[1] or 0) + delta)
-            await db.execute("UPDATE work_logs SET days=? WHERE id=?", (new_days, row[0]))
-        elif delta > 0:
-            await db.execute(
-                "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, ?, 0)",
-                (object_id, worker_id, today, delta)
-            )
-        await audit_log(db, update, context, object_id, "Корректировка дней",
-                        f"Работник: {name}; изменение {delta:+g} дн.; дата {today}")
-        await db.commit()
         async with db.execute(
             "SELECT COALESCE(SUM(days),0) FROM work_logs WHERE object_id=? AND worker_id=?",
             (object_id, worker_id)
         ) as cur:
-            total = (await cur.fetchone())[0]
+            total_before = float((await cur.fetchone())[0] or 0)
 
-    sign = "+" if delta > 0 else ""
+        # Не даём уйти в минус по итоговым дням
+        applied = delta
+        if total_before + applied < 0:
+            applied = -total_before
+
+        if applied == 0:
+            total = total_before
+        elif applied > 0:
+            # Добавляем дни — пишем/обновляем запись за сегодня
+            async with db.execute(
+                "SELECT id, days FROM work_logs WHERE object_id=? AND worker_id=? AND work_date=?",
+                (object_id, worker_id, today)
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE work_logs SET days=? WHERE id=?",
+                    ((row[1] or 0) + applied, row[0])
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, ?, 0)",
+                    (object_id, worker_id, today, applied)
+                )
+            total = total_before + applied
+        else:
+            # Убавляем дни — снимаем с записей (сначала сегодня, потом более поздние даты)
+            remain = -applied
+            async with db.execute(
+                """SELECT id, days FROM work_logs
+                   WHERE object_id=? AND worker_id=? AND days > 0
+                   ORDER BY CASE WHEN work_date = ? THEN 0 ELSE 1 END, work_date DESC""",
+                (object_id, worker_id, today)
+            ) as cur:
+                rows = await cur.fetchall()
+            for row_id, days_val in rows:
+                if remain <= 0:
+                    break
+                days_val = float(days_val or 0)
+                take = min(days_val, remain)
+                new_days = days_val - take
+                remain -= take
+                if new_days <= 0:
+                    await db.execute("DELETE FROM work_logs WHERE id=?", (row_id,))
+                else:
+                    await db.execute("UPDATE work_logs SET days=? WHERE id=?", (new_days, row_id))
+            total = max(0.0, total_before + applied)
+
+        await audit_log(
+            db, update, context, object_id, "Корректировка дней",
+            f"Работник: {name}; изменение {applied:+g} дн. (запрошено {delta:+g})"
+        )
+        await db.commit()
+
+    sign = "+" if applied > 0 else ""
+    extra = ""
+    if applied != delta:
+        extra = f"\n(запрошено {delta:+g}, применено {applied:+g} — дней не может быть меньше 0)"
     await update.message.reply_text(
-        f"✅ {name}: {sign}{delta:g} дн.\nТеперь всего дней: <b>{total:g}</b>",
+        f"✅ {name}: {sign}{applied:g} дн.{extra}\nТеперь всего дней: <b>{total:g}</b>",
         parse_mode="HTML"
     )
     context.user_data["corr_index"] += 1
