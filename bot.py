@@ -159,6 +159,8 @@ async def init_db():
             "ALTER TABLE objects ADD COLUMN work_type TEXT DEFAULT 'profit'",
             "ALTER TABLE workers ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE work_logs ADD COLUMN overtime_hours REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE expenses ADD COLUMN user_id INTEGER",
+            "ALTER TABLE expenses ADD COLUMN user_name TEXT",
         ]:
             try:
                 await db.execute(col_sql)
@@ -293,6 +295,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("✏️ Корректировка дней"), KeyboardButton("➕ Сверхурочные")],
         [KeyboardButton("💰 Аванс работнику"), KeyboardButton("💵 Поступление")],
         [KeyboardButton("🧾 Расход"), KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("📅 Расходы по дням")],
         [KeyboardButton("🕘 История операций")],
         [KeyboardButton("👷 Работники")],
         [KeyboardButton("🏗️ Объект"), KeyboardButton("⚙️ Настройки")],
@@ -873,8 +876,10 @@ async def expense_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "technician": "Техника", "other": "Другое"}
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO expenses (object_id, category, amount, description) VALUES (?, ?, ?, ?)",
-            (context.user_data["object_id"], context.user_data["category"], context.user_data["amount"], desc)
+            "INSERT INTO expenses (object_id, category, amount, description, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?)",
+            (context.user_data["object_id"], context.user_data["category"], context.user_data["amount"], desc,
+             update.effective_user.id,
+             " ".join(x for x in [update.effective_user.first_name, update.effective_user.last_name] if x) or update.effective_user.username or str(update.effective_user.id))
         )
         await audit_log(db, update, context, context.user_data["object_id"], "Расход",
                         f"Категория: {cat_names.get(context.user_data['category'], context.user_data['category'])}; сумма {context.user_data['amount']:,} ₩; {desc or 'без описания'}")
@@ -1454,6 +1459,116 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text[:3900], parse_mode="HTML")
 
 
+EXPENSE_HISTORY_DATE = 90
+
+
+async def expense_history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
+    if not obj:
+        await update.message.reply_text("Сначала открой или выбери рабочий объект.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    context.user_data["expense_history_object_id"] = obj["id"]
+    await update.message.reply_text(
+        "📅 За какой период показать расходы?\n\n"
+        "Напиши дату в формате ГГГГ-ММ-ДД, например 2026-10-22.\n"
+        "Или напиши «Сегодня» либо «7 дней».\n\n"
+        "❌ Отмена — вернуться в меню.",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Сегодня"), KeyboardButton("7 дней")], [KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    )
+    return EXPENSE_HISTORY_DATE
+
+
+async def expense_history_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    if raw == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        clear_temp_data(context)
+        return ConversationHandler.END
+    today = date.today()
+    if raw.lower() == "сегодня":
+        start_day = end_day = today
+    elif raw.lower() in ("7 дней", "7дней"):
+        from datetime import timedelta
+        start_day, end_day = today - timedelta(days=6), today
+    else:
+        try:
+            start_day = end_day = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            await update.message.reply_text("Не понял дату. Напиши, например, 2026-10-22, или выбери «Сегодня» / «7 дней».")
+            return EXPENSE_HISTORY_DATE
+
+    brigade_id = get_user_brigade_id(update.effective_user.id, context)
+    object_id = context.user_data.get("expense_history_object_id")
+    cat_names = {"food": "Питание", "transport": "Дорога", "housing": "Проживание", "technician": "Техника", "other": "Другое"}
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        params = [brigade_id, start_day.isoformat(), end_day.isoformat()]
+        object_filter = "AND e.object_id = ?"
+        params.append(object_id)
+        async with db.execute(
+            """SELECT e.created_at, e.category, e.amount, e.description, e.user_name, o.name AS object_name
+               FROM expenses e JOIN objects o ON o.id=e.object_id
+               WHERE o.brigade_id=? AND date(e.created_at) BETWEEN date(?) AND date(?) """ + object_filter + " ORDER BY e.created_at, e.id",
+            params
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text(
+            f"За период {start_day.isoformat()} — {end_day.isoformat()} расходов по выбранному объекту не найдено.",
+            reply_markup=main_keyboard(update.effective_user.id)
+        )
+        clear_temp_data(context)
+        return ConversationHandler.END
+
+    from collections import defaultdict
+    by_day = defaultdict(list)
+    for row in rows:
+        by_day[str(row["created_at"])[:10]].append(row)
+    lines = [f"🧾 <b>Расходы по дням</b>", f"Объект: <b>{escape(str(rows[0]['object_name']))}</b>",
+             f"Период: {start_day.isoformat()} — {end_day.isoformat()}", ""]
+    grand_total = 0
+    grand_categories = {}
+    for day_key in sorted(by_day):
+        day_total = 0
+        day_categories = {}
+        lines.append(f"<b>📅 {day_key}</b>")
+        for row in by_day[day_key]:
+            amount = int(row["amount"] or 0)
+            day_total += amount
+            grand_total += amount
+            day_categories[row["category"]] = day_categories.get(row["category"], 0) + amount
+            grand_categories[row["category"]] = grand_categories.get(row["category"], 0) + amount
+            time_text = str(row["created_at"])[11:16]
+            who = row["user_name"] or "Автор старой записи не сохранён"
+            category = cat_names.get(row["category"], row["category"])
+            desc = row["description"] or "без описания"
+            lines.append(f"• {escape(category)} — <b>{amount:,} ₩</b> · {escape(time_text)}")
+            lines.append(f"  Кто: {escape(str(who))}; {escape(str(desc))}")
+        lines.append(f"Итого за день: <b>{day_total:,} ₩</b>")
+        for cat, cat_total in sorted(day_categories.items()):
+            lines.append(f"  · {escape(cat_names.get(cat, cat))}: {cat_total:,} ₩")
+        lines.append("")
+    lines.append("<b>ИТОГО ПО КАТЕГОРИЯМ ЗА ПЕРИОД:</b>")
+    for cat, cat_total in sorted(grand_categories.items()):
+        lines.append(f"• {escape(cat_names.get(cat, cat))}: {cat_total:,} ₩")
+    lines.append(f"<b>ИТОГО ЗА ПЕРИОД: {grand_total:,} ₩</b>")
+    output = "\n".join(lines)
+    # Telegram limits message size; split by day/sections without cutting HTML tags.
+    if len(output) <= 3900:
+        await update.message.reply_text(output, parse_mode="HTML", reply_markup=main_keyboard(update.effective_user.id))
+    else:
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3500:
+                await update.message.reply_text(chunk, parse_mode="HTML")
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            await update.message.reply_text(chunk, parse_mode="HTML", reply_markup=main_keyboard(update.effective_user.id))
+    clear_temp_data(context)
+    return ConversationHandler.END
+
+
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
     if not obj:
@@ -1636,6 +1751,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📊 Отчёт$"), report_cmd))
     app.add_handler(MessageHandler(filters.Regex("^🕘 История операций$"), history_cmd))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📅 Расходы по дням$"), expense_history_start)],
+        states={EXPENSE_HISTORY_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_history_show)]},
+        fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
+        allow_reentry=True,
+    ))
     app.add_handler(MessageHandler(filters.Regex("^👷 Работники$"), workers_menu))
     app.add_handler(MessageHandler(filters.Regex("^🏗️ Объект$"), object_menu))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), settings_menu))
