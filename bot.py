@@ -38,7 +38,7 @@ def _parse_ids(value: str) -> list[int]:
                 print(f"Предупреждение: некорректный Telegram ID пропущен: {item!r}")
     return result
 
-SUPER_ADMIN_IDS = _parse_ids(os.environ.get("SUPER_ADMIN_IDS", ""))
+SUPER_ADMIN_IDS = _parse_ids(os.environ.get("121318132", ""))
 
 # Кто к какой бригаде привязан (полный доступ только к своей)
 # brigade_id: 1 = Основная, 2 = Команда Дастана
@@ -136,6 +136,17 @@ async def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brigade_id INTEGER NOT NULL,
+                object_id INTEGER,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                user_name TEXT,
+                action TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Бригады
         await db.execute("INSERT OR IGNORE INTO brigades (id, name) VALUES (1, 'Основная')")
@@ -207,6 +218,27 @@ def get_user_brigade_id(user_id: int, context: ContextTypes.DEFAULT_TYPE = None)
     return int(USER_BRIGADE.get(user_id, 1))
 
 
+def clear_temp_data(context: ContextTypes.DEFAULT_TYPE):
+    """Очищает временные данные диалога, сохраняя выбранную главным бригаду."""
+    active_brigade = context.user_data.get("active_brigade_id")
+    context.user_data.clear()
+    if active_brigade is not None:
+        context.user_data["active_brigade_id"] = active_brigade
+
+
+async def audit_log(db, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    object_id: int | None, action: str, details: str):
+    user = update.effective_user
+    brigade_id = get_user_brigade_id(user.id, context)
+    full_name = " ".join(part for part in [user.first_name, user.last_name] if part)
+    await db.execute(
+        """INSERT INTO audit_logs
+           (brigade_id, object_id, user_id, username, user_name, action, details)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (brigade_id, object_id, user.id, user.username, full_name or str(user.id), action, details)
+    )
+
+
 async def get_brigade_name(brigade_id: int) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT name FROM brigades WHERE id = ?", (brigade_id,)) as cur:
@@ -261,6 +293,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("✏️ Корректировка дней"), KeyboardButton("➕ Сверхурочные")],
         [KeyboardButton("💰 Аванс работнику"), KeyboardButton("💵 Поступление")],
         [KeyboardButton("🧾 Расход"), KeyboardButton("📊 Отчёт")],
+        [KeyboardButton("🕘 История операций")],
         [KeyboardButton("👷 Работники")],
         [KeyboardButton("🏗️ Объект"), KeyboardButton("⚙️ Настройки")],
     ]
@@ -303,7 +336,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keep = context.user_data.get("active_brigade_id")
-    context.user_data.clear()
+    clear_temp_data(context)
     if keep:
         context.user_data["active_brigade_id"] = keep
     await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
@@ -521,7 +554,7 @@ async def obj_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(msg, reply_markup=main_keyboard(update.effective_user.id))
     keep = context.user_data.get("active_brigade_id")
-    context.user_data.clear()
+    clear_temp_data(context)
     if keep:
         context.user_data["active_brigade_id"] = keep
     return ConversationHandler.END
@@ -635,7 +668,7 @@ async def mark_workers_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"Сверхурочные — кнопка «➕ Сверхурочные» ({int(float(ot_rate)):,} ₩/час).",
             reply_markup=main_keyboard(query.from_user.id)
         )
-        context.user_data.clear()
+        clear_temp_data(context)
         return ConversationHandler.END
 
     wid = int(data.split("_")[1])
@@ -695,7 +728,7 @@ async def mark_overtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         names = ", ".join(w["name"] for w in selected_workers)
         await update.message.reply_text(f"✅ Отмечено за {work_date}:\n{names}",
                                         reply_markup=main_keyboard(update.effective_user.id))
-        context.user_data.clear()
+        clear_temp_data(context)
         return ConversationHandler.END
     else:
         context.user_data["ot_index"] = ot_index
@@ -771,13 +804,15 @@ async def advance_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "INSERT INTO advances (object_id, worker_id, amount, note) VALUES (?, ?, ?, ?)",
                     (context.user_data["object_id"], wid, context.user_data["amount"], note)
                 )
+                await audit_log(db, update, context, context.user_data["object_id"], "Аванс",
+                                f"Работник ID {wid}; сумма {context.user_data['amount']:+,} ₩; {note or 'без комментария'}")
         await db.commit()
     names = ", ".join(context.user_data.get("worker_names", [])) or "выбранным работникам"
     amount = context.user_data["amount"]
     action = "Аванс добавлен" if amount > 0 else "Аванс уменьшен / возврат учтён"
     await update.message.reply_text(f"✅ {action}: {amount:+,} ₩ на каждого. Работники: {names}",
                                     reply_markup=main_keyboard(update.effective_user.id))
-    context.user_data.clear()
+    clear_temp_data(context)
     return ConversationHandler.END
 
 
@@ -841,12 +876,14 @@ async def expense_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO expenses (object_id, category, amount, description) VALUES (?, ?, ?, ?)",
             (context.user_data["object_id"], context.user_data["category"], context.user_data["amount"], desc)
         )
+        await audit_log(db, update, context, context.user_data["object_id"], "Расход",
+                        f"Категория: {cat_names.get(context.user_data['category'], context.user_data['category'])}; сумма {context.user_data['amount']:,} ₩; {desc or 'без описания'}")
         await db.commit()
     await update.message.reply_text(
         f"✅ Расход {context.user_data['amount']:,} ₩ ({cat_names.get(context.user_data['category'])}) добавлен.",
         reply_markup=main_keyboard(update.effective_user.id)
     )
-    context.user_data.clear()
+    clear_temp_data(context)
     return ConversationHandler.END
 
 
@@ -992,7 +1029,7 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=main_keyboard(update.effective_user.id)
     )
     keep = context.user_data.get("active_brigade_id")
-    context.user_data.clear()
+    clear_temp_data(context)
     if keep:
         context.user_data["active_brigade_id"] = keep
     return ConversationHandler.END
@@ -1071,7 +1108,7 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.commit()
         if cur.rowcount == 0:
             await update.message.reply_text("Не удалось изменить: работники не найдены в текущей бригаде.")
-            context.user_data.clear()
+            clear_temp_data(context)
             return ConversationHandler.END
 
     target_label = "у всех активных работников" if context.user_data.get("edit_all_workers") else "у работника"
@@ -1080,7 +1117,7 @@ async def worker_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(update.effective_user.id)
     )
     keep = context.user_data.get("active_brigade_id")
-    context.user_data.clear()
+    clear_temp_data(context)
     if keep:
         context.user_data["active_brigade_id"] = keep
     return ConversationHandler.END
@@ -1114,9 +1151,12 @@ async def corr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала создайте объект.")
         return ConversationHandler.END
     context.user_data["object_id"] = obj["id"]
-    context.user_data["corr_selected"] = set()
-    await corr_show_workers(update.message, context, update.effective_user.id)
-    return CORR_WORKER
+    await update.message.reply_text(
+        "✅ Корректировка выбранных работников завершена.",
+        reply_markup=main_keyboard(update.effective_user.id)
+    )
+    clear_temp_data(context)
+    return ConversationHandler.END
 
 
 async def corr_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1212,6 +1252,8 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "INSERT INTO work_logs (object_id, worker_id, work_date, days, overtime_hours) VALUES (?, ?, ?, ?, 0)",
                 (object_id, worker_id, today, delta)
             )
+        await audit_log(db, update, context, object_id, "Корректировка дней",
+                        f"Работник: {name}; изменение {delta:+g} дн.; дата {today}")
         await db.commit()
         async with db.execute(
             "SELECT COALESCE(SUM(days),0) FROM work_logs WHERE object_id=? AND worker_id=?",
@@ -1229,9 +1271,12 @@ async def corr_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await corr_prompt_current(update.message, context)
         return CORR_DELTA
 
-    context.user_data["corr_selected"] = set()
-    await corr_show_workers(update.message, context, update.effective_user.id)
-    return CORR_WORKER
+    await update.message.reply_text(
+        "✅ Корректировка выбранных работников завершена.",
+        reply_markup=main_keyboard(update.effective_user.id)
+    )
+    clear_temp_data(context)
+    return ConversationHandler.END
 
 
 # ================== ПОСТУПЛЕНИЕ ОТ ЗАКАЗЧИКА ==================
@@ -1278,6 +1323,8 @@ async def receipt_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO receipts (object_id, amount, note) VALUES (?, ?, ?)",
             (context.user_data["object_id"], context.user_data["amount"], note)
         )
+        await audit_log(db, update, context, context.user_data["object_id"], "Поступление",
+                        f"Сумма {context.user_data['amount']:+,} ₩; {note or 'без комментария'}")
         await db.commit()
         async with db.execute(
             "SELECT COALESCE(SUM(amount),0) FROM receipts WHERE object_id = ?",
@@ -1295,7 +1342,7 @@ async def receipt_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=main_keyboard(update.effective_user.id)
     )
-    context.user_data.clear()
+    clear_temp_data(context)
     return ConversationHandler.END
 
 
@@ -1374,11 +1421,39 @@ async def overtime_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Каждому из выбранных работников ({', '.join(context.user_data.get('worker_names', []))}): +{hours:g} ч сверхурочных (+{pay:,} ₩ на человека)",
         reply_markup=main_keyboard(update.effective_user.id)
     )
-    context.user_data.clear()
+    clear_temp_data(context)
     return ConversationHandler.END
 
 
 # ================== ОТЧЁТ ==================
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brigade_id = get_user_brigade_id(update.effective_user.id, context)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT a.created_at, a.user_name, a.username, a.action, a.details,
+                      o.name AS object_name
+               FROM audit_logs a LEFT JOIN objects o ON o.id = a.object_id
+               WHERE a.brigade_id = ? ORDER BY a.id DESC LIMIT 40""",
+            (brigade_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text("История пока пустая. Новые расходы, авансы и поступления будут записываться сюда.")
+        return
+    lines = ["<b>🕘 История операций (последние 40)</b>", ""]
+    for r in rows:
+        who = r["user_name"] or ("@" + r["username"] if r["username"] else "пользователь")
+        obj = r["object_name"] or "объект не указан"
+        lines.append(f"<b>{escape(str(r['action']))}</b> · {escape(str(r['created_at']))}")
+        lines.append(f"Кто: {escape(str(who))} · Объект: {escape(str(obj))}")
+        lines.append(escape(str(r["details"])))
+        lines.append("")
+    text = "\n".join(lines)
+    # Telegram message limit safety: show newest entries and keep below ~3900 chars.
+    await update.message.reply_text(text[:3900], parse_mode="HTML")
+
+
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = await get_active_object(get_user_brigade_id(update.effective_user.id, context))
     if not obj:
@@ -1460,8 +1535,8 @@ async def generate_report(object_id: int, brigade_id: int) -> str:
         lines.append(f"👷 <b>Зарплаты (всего):</b> {total_wages:,} ₩")
         lines.append(f"🧾 <b>Расходы (всего):</b> {total_expenses:,} ₩")
         cat_names = {"food": "Питание", "transport": "Дорога", "housing": "Проживание", "technician": "Техника", "other": "Другое"}
-        for c, s in exp_by_cat.items():
-            lines.append(f"   • {cat_names.get(c, c)}: {s:,} ₩")
+        for c in ("food", "transport", "housing", "technician", "other"):
+            lines.append(f"   • {cat_names[c]}: {exp_by_cat.get(c, 0):,} ₩")
         if not is_daily:
             lines.append(f"📈 <b>Прибыль (остаток):</b> {profit:,} ₩")
         lines += [
@@ -1560,6 +1635,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📊 Отчёт$"), report_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^🕘 История операций$"), history_cmd))
     app.add_handler(MessageHandler(filters.Regex("^👷 Работники$"), workers_menu))
     app.add_handler(MessageHandler(filters.Regex("^🏗️ Объект$"), object_menu))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), settings_menu))
