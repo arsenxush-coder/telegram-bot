@@ -44,9 +44,12 @@ SUPER_ADMIN_IDS = _parse_ids(os.environ.get("SUPER_ADMIN_IDS", ""))
 # Кто к какой бригаде привязан (полный доступ только к своей)
 # brigade_id: 1 = Основная, 2 = Команда Дастана
 USER_BRIGADE = {
-    # 121318132: 1,   # помощник основной бригады
+    # Старые привязки автоматически переносятся в таблицу user_access при запуске.
     722258878: 2,    # Команда Дастана
 }
+
+# Кэш прав загружается из SQLite при старте и обновляется при управлении пользователями.
+USER_ACCESS_CACHE: dict[int, dict] = {}
 
 # На Railway с Volume: переменная DB_PATH=/data/brigade.db
 DB_PATH = os.environ.get("DB_PATH", "brigade.db")
@@ -161,6 +164,14 @@ async def init_db():
                 details TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','+9 hours'))
             );
+            CREATE TABLE IF NOT EXISTS user_access (
+                user_id INTEGER PRIMARY KEY,
+                brigade_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('manager','user')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            );
         """)
         # Бригады
         await db.execute("INSERT OR IGNORE INTO brigades (id, name) VALUES (1, 'Основная')")
@@ -201,7 +212,19 @@ async def init_db():
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('ot_rate', ?)",
             (str(DEFAULT_OT_RATE),)
         )
+        # Переносим старые привязки из USER_BRIGADE, не затрагивая уже настроенные права.
+        for legacy_uid, legacy_bid in USER_BRIGADE.items():
+            await db.execute(
+                "INSERT OR IGNORE INTO user_access (user_id, brigade_id, role, is_active, created_at) VALUES (?, ?, 'manager', 1, ?)",
+                (legacy_uid, legacy_bid, korea_timestamp())
+            )
         await db.commit()
+        USER_ACCESS_CACHE.clear()
+        async with db.execute("SELECT user_id, brigade_id, role, is_active FROM user_access") as cur:
+            for row in await cur.fetchall():
+                USER_ACCESS_CACHE[int(row[0])] = {
+                    "brigade_id": int(row[1]), "role": row[2], "is_active": bool(row[3])
+                }
 
 
 async def get_setting(key: str, default: str = "") -> str:
@@ -222,7 +245,21 @@ def is_super(user_id: int) -> bool:
 
 
 def is_allowed(user_id: int) -> bool:
-    return is_super(user_id) or user_id in USER_BRIGADE
+    if is_super(user_id):
+        return True
+    access = USER_ACCESS_CACHE.get(user_id)
+    return bool(access and access.get("is_active"))
+
+
+def user_role(user_id: int) -> str:
+    if is_super(user_id):
+        return "super"
+    access = USER_ACCESS_CACHE.get(user_id, {})
+    return access.get("role", "") if access.get("is_active") else ""
+
+
+def can_manage_users(user_id: int) -> bool:
+    return is_super(user_id) or user_role(user_id) == "manager"
 
 
 def get_user_brigade_id(user_id: int, context: ContextTypes.DEFAULT_TYPE = None) -> int:
@@ -231,8 +268,10 @@ def get_user_brigade_id(user_id: int, context: ContextTypes.DEFAULT_TYPE = None)
         if bid:
             return int(bid)
         return 1
+    access = USER_ACCESS_CACHE.get(user_id)
+    if access and access.get("is_active"):
+        return int(access["brigade_id"])
     return int(USER_BRIGADE.get(user_id, 1))
-
 
 def clear_temp_data(context: ContextTypes.DEFAULT_TYPE):
     """Очищает временные данные диалога, сохраняя выбранную главным бригаду."""
@@ -303,7 +342,8 @@ async def get_workers(brigade_id: int, active_only: bool = True) -> list:
 
 
 def is_admin(user_id: int) -> bool:
-    return is_allowed(user_id)
+    # Главный администратор и назначенный бригадир могут управлять объектами/работниками.
+    return can_manage_users(user_id)
 
 
 async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,8 +351,11 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user is None:
         raise ApplicationHandlerStop
     if not is_allowed(user.id):
+        # Незарегистрированному человеку разрешён только /start, чтобы он мог узнать свой ID.
+        if update.message and update.message.text and update.message.text.strip().startswith("/start"):
+            return
         if update.message:
-            await update.message.reply_text("⛔ Доступ запрещён.\nОбратитесь к бригадиру.")
+            await update.message.reply_text("⛔ Доступ не предоставлен.\nНапишите /start и отправьте свой Telegram ID бригадиру.")
         elif update.callback_query:
             await update.callback_query.answer("Доступ запрещён", show_alert=True)
         raise ApplicationHandlerStop
@@ -327,8 +370,12 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("📅 Расходы по дням")],
         [KeyboardButton("🕘 История операций")],
         [KeyboardButton("👷 Работники")],
-        [KeyboardButton("🏗️ Объект"), KeyboardButton("⚙️ Настройки")],
+        [KeyboardButton("🏗️ Объект")],
     ]
+    if can_manage_users(user_id):
+        buttons.append([KeyboardButton("⚙️ Настройки")])
+    if can_manage_users(user_id):
+        buttons.append([KeyboardButton("👥 Пользователи")])
     if is_super(user_id):
         buttons.append([KeyboardButton("🔄 Сменить бригаду")])
     buttons.append([KeyboardButton("ℹ️ Помощь")])
@@ -338,6 +385,14 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 # ================== СТАРТ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text(
+            "⛔ У вас пока нет доступа к боту.\n\n"
+            f"Ваш Telegram ID: <code>{user_id}</code>\n\n"
+            "Отправьте этот номер главному администратору или бригадиру, чтобы он добавил вас.",
+            parse_mode="HTML"
+        )
+        return
     bid = get_user_brigade_id(user_id, context)
     bname = await get_brigade_name(bid)
     text = (
@@ -421,17 +476,17 @@ async def switch_brigade_callback(update: Update, context: ContextTypes.DEFAULT_
 
 # ================== ОБЪЕКТ ==================
 async def object_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Нет доступа.")
-        return
     bid = get_user_brigade_id(update.effective_user.id, context)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM objects WHERE brigade_id=? AND status='open' ORDER BY id DESC", (bid,)) as cur:
             objects = [dict(r) for r in await cur.fetchall()]
     if not objects:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Новый объект", callback_data="obj_new")]])
-        await update.message.reply_text("Нет открытых объектов. Создайте новый.", reply_markup=kb)
+        if is_admin(update.effective_user.id):
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Новый объект", callback_data="obj_new")]])
+            await update.message.reply_text("Нет открытых объектов. Создайте новый.", reply_markup=kb)
+        else:
+            await update.message.reply_text("В вашей бригаде сейчас нет открытых объектов. Обратитесь к бригадиру.")
         return
     selected_id = context.user_data.get("selected_object_id")
     selected = next((o for o in objects if o["id"] == selected_id), objects[0])
@@ -440,13 +495,15 @@ async def object_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for obj in objects:
         prefix = "✅ " if obj["id"] == selected["id"] else ""
         buttons.append([InlineKeyboardButton(f"{prefix}{obj['name']}", callback_data=f"obj_select_{obj['id']}")])
-    if (selected.get("work_type") or "profit") != "daily":
-        buttons.append([InlineKeyboardButton("💰 Указать/изменить сумму", callback_data="obj_set_sum")])
-    buttons.extend([
-        [InlineKeyboardButton("📋 Инфо об объекте", callback_data="obj_info")],
-        [InlineKeyboardButton("🔒 Закрыть выбранный объект + отчёт", callback_data="obj_close")],
-        [InlineKeyboardButton("➕ Новый объект", callback_data="obj_new")],
-    ])
+    if is_admin(update.effective_user.id):
+        if (selected.get("work_type") or "profit") != "daily":
+            buttons.append([InlineKeyboardButton("💰 Указать/изменить сумму", callback_data="obj_set_sum")])
+    buttons.append([InlineKeyboardButton("📋 Инфо об объекте", callback_data="obj_info")])
+    if is_admin(update.effective_user.id):
+        buttons.extend([
+            [InlineKeyboardButton("🔒 Закрыть выбранный объект + отчёт", callback_data="obj_close")],
+            [InlineKeyboardButton("➕ Новый объект", callback_data="obj_new")],
+        ])
     type_label = "илтан" if (selected.get("work_type") or "profit") == "daily" else "с прибылью"
     text = (f"<b>Выбранный объект:</b> {escape(selected['name'])}\n"
             f"Тип: {type_label}\nСумма: {selected['total_sum']:,} ₩\n"
@@ -457,8 +514,11 @@ async def object_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def obj_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
+    if data in ("obj_close", "obj_close_yes", "obj_close_no", "obj_new", "obj_set_sum") and not is_admin(query.from_user.id):
+        await query.answer("Только бригадир может управлять объектами", show_alert=True)
+        return
+    await query.answer()
 
     if data.startswith("obj_select_"):
         try:
@@ -541,6 +601,9 @@ async def obj_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_new_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Только бригадир может создавать объекты", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 С прибылью (%, остаток)", callback_data="type_profit")],
@@ -569,6 +632,9 @@ async def choose_work_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_set_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Только бригадир может менять сумму объекта", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     await query.message.reply_text(
         "Введите сумму объекта (только число):",
@@ -1044,6 +1110,155 @@ async def expense_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==================
+async def users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not can_manage_users(uid):
+        await update.message.reply_text("Нет доступа.")
+        return
+    bid = get_user_brigade_id(uid, context)
+    bname = await get_brigade_name(bid)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить пользователя", callback_data="usr_add")],
+        [InlineKeyboardButton("📋 Список пользователей", callback_data="usr_list")],
+    ])
+    await update.message.reply_text(f"Управление доступом · <b>{bname}</b>", reply_markup=kb, parse_mode="HTML")
+
+
+async def users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not can_manage_users(uid):
+        await q.answer("Нет доступа", show_alert=True)
+        return
+    await q.answer()
+    if q.data == "usr_add":
+        context.user_data["user_access_add_brigade"] = get_user_brigade_id(uid, context)
+        await q.message.reply_text(
+            "Введите Telegram ID нового пользователя.\n"
+            "Человек должен сначала написать боту /start, чтобы узнать свой ID.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        )
+        context.user_data["awaiting_user_access_id"] = True
+        return
+    if q.data == "usr_list":
+        bid = get_user_brigade_id(uid, context)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id, role, is_active FROM user_access WHERE brigade_id=? ORDER BY is_active DESC, user_id",
+                (bid,)
+            ) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            await q.message.reply_text("В этой бригаде пока нет добавленных пользователей.")
+            return
+        buttons = []
+        lines = ["<b>Пользователи бригады:</b>"]
+        for row in rows:
+            role_name = "Бригадир" if row["role"] == "manager" else "Пользователь"
+            status = "✅" if row["is_active"] else "⛔"
+            lines.append(f"{status} <code>{row['user_id']}</code> — {role_name}")
+            if row["is_active"]:
+                buttons.append([InlineKeyboardButton(f"⛔ Отключить {row['user_id']}", callback_data=f"usr_off_{row['user_id']}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"✅ Вернуть {row['user_id']}", callback_data=f"usr_on_{row['user_id']}")])
+        await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+    if q.data.startswith(("usr_off_", "usr_on_")):
+        enable = q.data.startswith("usr_on_")
+        try:
+            target_id = int(q.data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        bid = get_user_brigade_id(uid, context)
+        if target_id == uid and not is_super(uid):
+            await q.message.reply_text("Нельзя отключить собственный доступ.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            if not is_super(uid):
+                async with db.execute("SELECT role FROM user_access WHERE user_id=? AND brigade_id=?", (target_id, bid)) as cur:
+                    target_row = await cur.fetchone()
+                if target_row and target_row[0] == "manager":
+                    await q.message.reply_text("Бригадир не может отключать другого бригадира.")
+                    return
+            await db.execute(
+                "UPDATE user_access SET is_active=? WHERE user_id=? AND brigade_id=?",
+                (1 if enable else 0, target_id, bid)
+            )
+            await db.commit()
+        if target_id in USER_ACCESS_CACHE:
+            USER_ACCESS_CACHE[target_id]["is_active"] = enable
+        await q.message.reply_text("Доступ восстановлен." if enable else "Доступ отключён.")
+        return
+    if q.data.startswith("usr_role_"):
+        role = q.data.rsplit("_", 1)[1]
+        target_id = context.user_data.get("pending_user_access_id")
+        bid = context.user_data.get("user_access_add_brigade")
+        if not target_id or not bid or role not in ("manager", "user"):
+            await q.message.reply_text("Не удалось завершить добавление. Начните заново через «Пользователи».")
+            return
+        # Бригадир может назначать только обычных пользователей; повышать права может только главный.
+        if role == "manager" and not is_super(uid):
+            await q.message.reply_text("Назначать бригадиров может только главный администратор.")
+            return
+        if target_id in SUPER_ADMIN_IDS:
+            await q.message.reply_text("Главного администратора нельзя добавить как обычного пользователя.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT brigade_id, role FROM user_access WHERE user_id=?", (target_id,)) as cur:
+                existing_access = await cur.fetchone()
+            if existing_access and not is_super(uid):
+                if int(existing_access[0]) != int(bid):
+                    await q.message.reply_text("Этот Telegram ID уже привязан к другой бригаде. Перенести пользователя может только главный администратор.")
+                    return
+                if existing_access[1] == "manager":
+                    await q.message.reply_text("Изменять доступ другого бригадира может только главный администратор.")
+                    return
+            await db.execute(
+                "INSERT INTO user_access (user_id, brigade_id, role, is_active, added_by, created_at) "
+                "VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "brigade_id=excluded.brigade_id, role=excluded.role, is_active=1, added_by=excluded.added_by",
+                (target_id, bid, role, uid, korea_timestamp())
+            )
+            await db.commit()
+        USER_ACCESS_CACHE[target_id] = {"brigade_id": int(bid), "role": role, "is_active": True}
+        context.user_data.pop("pending_user_access_id", None)
+        context.user_data.pop("awaiting_user_access_id", None)
+        context.user_data.pop("user_access_add_brigade", None)
+        role_label = "Бригадир" if role == "manager" else "Пользователь"
+        await q.message.reply_text(
+            f"✅ Пользователь <code>{target_id}</code> добавлен.\nРоль: <b>{role_label}</b>",
+            parse_mode="HTML", reply_markup=main_keyboard(uid)
+        )
+
+
+async def users_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_user_access_id"):
+        return
+    if update.message.text == "❌ Отмена":
+        context.user_data.pop("awaiting_user_access_id", None)
+        context.user_data.pop("user_access_add_brigade", None)
+        await update.message.reply_text("Добавление отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        return
+    try:
+        target_id = int(update.message.text.strip())
+        if target_id <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Нужен числовой Telegram ID. Попробуйте ещё раз.")
+        return
+    if target_id in SUPER_ADMIN_IDS:
+        await update.message.reply_text("Этот ID уже является главным администратором.")
+        return
+    context.user_data["pending_user_access_id"] = target_id
+    context.user_data["awaiting_user_access_id"] = False
+    rows = [[InlineKeyboardButton("👷 Пользователь", callback_data="usr_role_user")]]
+    if is_super(update.effective_user.id):
+        rows.append([InlineKeyboardButton("🛠 Бригадир", callback_data="usr_role_manager")])
+    await update.message.reply_text("Выберите уровень доступа:", reply_markup=InlineKeyboardMarkup(rows))
+
+
 # ================== РАБОТНИКИ ==================
 async def workers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     workers = await get_workers(get_user_brigade_id(update.effective_user.id, context), active_only=False)
@@ -1063,8 +1278,11 @@ async def workers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Вход в диалог добавления работника (только через ConversationHandler)."""
+    """Вход в диалог добавления работника (только для бригадира/главного)."""
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     # сохраняем бригаду, чистим временные поля прошлого диалога
     keep = context.user_data.get("active_brigade_id")
@@ -1082,6 +1300,9 @@ async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def workers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
     await query.answer()
     if query.data == "w_edit":
         brigade_id = get_user_brigade_id(update.effective_user.id, context)
@@ -1106,6 +1327,9 @@ async def workers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def worker_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
     await query.answer()
     data = query.data
     if data == "wdel_cancel":
@@ -1196,6 +1420,9 @@ async def add_worker_percent(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def worker_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     target = query.data.split("_", 1)[1]
     brigade_id = get_user_brigade_id(query.from_user.id, context)
@@ -1896,6 +2123,9 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
     await query.answer()
     if query.data == "set_ot":
         await query.message.reply_text(
@@ -1950,6 +2180,9 @@ def main():
         fallbacks=[MessageHandler(filters.Regex("^❌ Отмена$"), cancel)],
         allow_reentry=True,
     ))
+    app.add_handler(MessageHandler(filters.Regex("^👥 Пользователи$"), users_menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, users_id_input), group=1)
+    app.add_handler(CallbackQueryHandler(users_callback, pattern=r"^usr_(add|list|off_\d+|on_\d+|role_(manager|user))$"))
     app.add_handler(MessageHandler(filters.Regex("^👷 Работники$"), workers_menu))
     app.add_handler(MessageHandler(filters.Regex("^🏗️ Объект$"), object_menu))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), settings_menu))
